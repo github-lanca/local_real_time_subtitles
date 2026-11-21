@@ -95,6 +95,7 @@ overlay.setContent() 按 cue 时间窗渲染浮动字幕
 │
 ├── tools/
 │   ├── fetch_models.sh       # 一键下模型（国内镜像）
+│   ├── hardsub_check.py      # 画面硬字幕检测（底部字幕带 + Vision OCR）
 │   ├── detach.py             # setsid 启动，避免服务随启动方退出
 │   ├── probe.py              # 单窗口诊断：VAD 多阈值 + 原始识别 + 当前判定
 │   ├── report_logs.py        # 汇总：出字幕/丢弃统计、可疑丢弃
@@ -213,6 +214,7 @@ python3 tools/bench_bridge.py /path/to/film.mp4 100 12 4.0
 | 插件改了代码不生效 | IINA 只在启动时加载插件：设置 → 插件 → 选中本插件 → **Reload**，或重启 IINA |
 | 打开片子没反应 | 看 `logs/plugin.log`：`skip: subtitle showing` 表示检测到已有字幕轨；`auto: ... -> activate` 才是接管 |
 | 某些段落只有「啊～」 | 该段是连续气声/非语言发声，本地模型听不出稳定文字（mlx 各温度都循环、CT2 需 17–22s 且不稳定）。这是有意的降级 |
+| 片源自带"烧进去"的字幕，AI 字幕还叠上来 | 开播时会自动检测：只裁底部 18% 字幕带做 macOS Vision OCR，命中就跳过（日志 `skip: burned-in subtitle detected`）。想手动切换用插件菜单「AI 字幕：开 / 关」 |
 | 字幕偶尔出现日文 | 已加译文校验（含假名即判失败并重试）；若仍出现，看 `logs/films/` 里对应的 `[识别]` 行反馈 |
 
 ---

@@ -12,6 +12,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time as time_mod
@@ -1042,6 +1043,37 @@ def process(video, start, duration, context, language="ja"):
         return done({"ok": True, "ja": ja, "zh": " ".join(c["zh"] for c in cues), "cues": cues})
 
 
+HARDSUB_TIMEOUT = 45
+_hardsub_cache = {}
+
+
+def check_hardsub(video, start):
+    """画面里是否已经有烧进去的字幕（硬字幕）。
+
+    只裁底部字幕带、交给 tools/hardsub_check.py（macOS Vision OCR）判定。
+    每 5 分钟粒度缓存一次，避免同一部片反复检测。
+    """
+    key = (video, int(float(start) // 300))
+    if key in _hardsub_cache:
+        return _hardsub_cache[key]
+    script = os.path.join(ROOT, "tools", "hardsub_check.py")
+    data = {"hardsub": False, "samples": []}
+    try:
+        out = subprocess.run([sys.executable, script, video, str(float(start))],
+                             capture_output=True, text=True, timeout=HARDSUB_TIMEOUT)
+        tail = [l for l in (out.stdout or "").splitlines() if l.strip().startswith("{")]
+        if tail:
+            data = json.loads(tail[-1])
+        elif out.stderr:
+            data = {"hardsub": False, "samples": [], "error": out.stderr.strip()[:200]}
+    except Exception as e:
+        data = {"hardsub": False, "samples": [], "error": "%s: %s" % (type(e).__name__, e)}
+    _hardsub_cache[key] = data
+    trace("[hardsub] %s @%.1f -> %s %s" % (os.path.basename(video), float(start),
+          data.get("hardsub"), data.get("error", "")))
+    return data
+
+
 def probe(video, start, duration, language="ja"):
     """Explain one window end-to-end: VAD at several thresholds, the raw greedy
     transcription, and which rule the current settings would apply.
@@ -1136,6 +1168,21 @@ class Handler(BaseHTTPRequestHandler):
                 "mlx_error": _mlx_error,
                 "llama": health_check(18181),
             })
+        elif self.path.startswith("/hardsub"):
+            try:
+                from urllib.parse import urlparse, parse_qs, unquote
+                q = parse_qs(urlparse(self.path).query)
+                video = unquote((q.get("video") or [""])[0])
+                start = float((q.get("start") or ["0"])[0])
+                if not video or not os.path.isfile(video):
+                    self._json({"ok": False, "hardsub": False, "error": "video not found"}, 400)
+                    return
+                data = check_hardsub(video, start)
+                out = {"ok": True}
+                out.update(data)
+                self._json(out)
+            except Exception as e:
+                self._json({"ok": False, "hardsub": False, "error": str(e)}, 500)
         else:
             self._json({"error": "not found"}, 404)
 

@@ -8,7 +8,7 @@ const path = require("path");
 const SRC = path.join(__dirname, "..", "live-ai-subs", "main.js");
 
 function makeEnv(scenario) {
-  const calls = { osd: [], setContent: [], exec: [], post: [], logs: [], healthLeft: scenario.healthDown || 0 };
+  const calls = { osd: [], setContent: [], exec: [], post: [], logs: [], menu: [], healthLeft: scenario.healthDown || 0 };
   const status = Object.assign(
     { idle: false, url: "file:///tmp/movie.mp4", position: 0, duration: 0, speed: 1, isNetworkResource: false },
     scenario.status || {}
@@ -31,7 +31,11 @@ function makeEnv(scenario) {
         setContent: (h) => calls.setContent.push(h),
       },
       http: {
-        get: async () => {
+        get: async (url) => {
+          if (String(url).indexOf("/hardsub") >= 0) {
+            calls.hardsubQueries = (calls.hardsubQueries || 0) + 1;
+            return { text: JSON.stringify({ ok: true, hardsub: !!scenario.hardsub, samples: [] }) };
+          }
           if (scenario.healthDown && calls.healthLeft-- > 0) throw new Error("ECONNREFUSED");
           return { text: JSON.stringify({ ok: true, whisper: true, llama: true }) };
         },
@@ -41,6 +45,11 @@ function makeEnv(scenario) {
         },
       },
       utils: { exec: (file, args) => { calls.exec.push([file].concat(args || [])); return { status: 0 }; } },
+      menu: {
+        item: (title, action, opts) => ({ title, action, opts }),
+        addItem: (it) => calls.menu.push(it.title),
+        separator: () => ({ title: "---" }),
+      },
     },
   };
   return { env, calls, status, subtitle };
@@ -77,6 +86,7 @@ async function run(scenario, ticks, label, delay) {
   console.log("\n=== " + label + " ===");
   console.log("  日志: " + calls.logs.filter((l) => /auto:|skip:|new file|ACTIVE/.test(l)).join(" | "));
   console.log("  启动服务: " + started + "   AI 字幕激活: " + active + "   请求数: " + calls.post.length);
+  if (calls.menu.length) console.log("  菜单项: " + calls.menu.join(" | "));
   return { started, active, calls };
 }
 
@@ -133,7 +143,16 @@ async function run(scenario, ticks, label, delay) {
     { status: { position: 3.8 } },
   ], "E 服务未运行 -> 自动拉起");
 
-  const ok = a.active && !b.active && c.active && !d.active && e.started && e.active;
+  // F) 画面已有硬字幕 -> 不应启动 AI 字幕
+  const f = await run({ hardsub: true }, [
+    {},
+    { status: { duration: 5400, position: 0.3 } },
+    { status: { position: 0.6 } },
+    { status: { position: 1.0 } },
+    { status: { position: 1.4 } },
+  ], "F 画面有硬字幕");
+
+  const ok = a.active && !b.active && c.active && !d.active && e.started && e.active && !f.active;
   console.log("\n结果: " + (ok ? "PASS" : "FAIL"));
   process.exit(ok ? 0 : 1);
 })();

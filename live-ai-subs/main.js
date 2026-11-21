@@ -1,6 +1,6 @@
 // Live AI Subtitles - IINA plugin
 // Poll-driven so it works regardless of when file/overlay events fire.
-const { console, core, event, overlay, http, utils } = iina;
+const { console, core, event, overlay, http, utils, menu } = iina;
 
 const BRIDGE = "http://127.0.0.1:18182";
 // Where this repo is cloned. $HOME is expanded by bash (unquoted in the exec
@@ -77,7 +77,7 @@ function log(msg) {
   const line = new Date().toISOString().slice(11, 23) + " " + msg;
   console.log("[LiveAI] " + msg);
   logBuf.push(line);
-  if (logBuf.length >= 12 || Date.now() - lastLogFlush > 3000) flushLog();
+  if (logBuf.length >= 30 || Date.now() - lastLogFlush > 8000) flushLog();
 }
 
 function say(msg) { try { core.osd("[AI字幕] " + msg); } catch (e) {} }
@@ -167,6 +167,21 @@ async function checkBridge() {
     const d = JSON.parse(r.text);
     return d.ok && d.whisper && d.llama;
   } catch (e) { return false; }
+}
+
+// 画面里是否已经有烧进去的字幕（硬字幕）。失败一律当 false（宁可多开字幕）。
+async function hasBurnedInSubs(path, pos) {
+  try {
+    const url = BRIDGE + "/hardsub?video=" + encodeURIComponent(path) +
+                "&start=" + Math.max(0, pos).toFixed(1);
+    const r = await http.get(url);
+    const d = JSON.parse(r.text);
+    if (d && d.ok) log("hardsub check: " + (d.hardsub ? "detected" : "none"));
+    return !!(d && d.hardsub);
+  } catch (e) {
+    log("hardsub check failed: " + e);
+    return false;
+  }
 }
 
 async function ensureServices() {
@@ -320,7 +335,7 @@ async function tick() {
   // has had SETTLE_MS to settle (IINA scans embedded tracks slightly after
   // load; slow disks need more), then start AI subtitles only if nothing is
   // actually being displayed.
-  if (!decidedPath && pendingPath && pendingPath === path && !active) {
+  if (!decidedPath && pendingPath && pendingPath === path && !active && userPaused !== path) {
     // A network stream has no local file to decode, so decide (skip) at once
     // instead of waiting for a duration that never arrives.
     const ready = core.status.isNetworkResource ||
@@ -338,6 +353,14 @@ async function tick() {
         } else if (core.status.isNetworkResource) {
           log("skip: network resource (local ASR not applicable)");
         } else {
+          // 没有字幕轨，但画面里可能有"烧进去"的字幕（这些片源很常见）。
+          // 只截底部字幕带做 OCR，命中就不再叠加 AI 字幕。
+          const burned = await hasBurnedInSubs(path, pos);
+          if (burned) {
+            log("skip: burned-in subtitle detected in picture");
+            say("画面已有硬字幕，跳过 AI 字幕");
+            return;
+          }
           log("auto: no subtitle showing (tracks=" + st.count + " id=" + st.id + ") -> activate");
           await activate(path);   // starts the local services when needed
           return;                 // lastPosition was just reset by activate()
@@ -426,4 +449,38 @@ setInterval(() => {
   tickRunning = true;
   tick().catch((e) => log("tick exception: " + e)).finally(() => { tickRunning = false; });
 }, TICK_MS);
+// --- 插件菜单：IINA 设置里的开关只在重载时生效，这里给一个立即生效的开关 ---
+let userPaused = "";   // 被用户手动暂停的影片路径
+
+function toggleSubtitles() {
+  if (active) {
+    userPaused = currentVideo;
+    deactivate("paused by user");
+    say("AI 字幕已暂停");
+  } else if (currentVideo) {
+    userPaused = "";
+    decidedPath = currentVideo;
+    activate(currentVideo);
+  } else {
+    say("当前没有播放中的影片");
+  }
+}
+
+try {
+  menu.addItem(menu.item("AI 字幕：开 / 关", () => toggleSubtitles()));
+  menu.addItem(menu.item("AI 字幕：本片已有硬字幕（本片不再启用）", () => {
+    const p = currentVideo;
+    if (!p) return;
+    userPaused = p;
+    decidedPath = p;
+    deactivate("marked as hardsub");
+    say("已标记本片有硬字幕，本片不再启用 AI 字幕");
+  }));
+  menu.addItem(menu.item("AI 字幕：服务状态", () => {
+    http.get(BRIDGE + "/health").then((r) => {
+      try { say("服务: " + r.text.replace(/[{}"]/g, "")); } catch (e) {}
+    }).catch(() => say("服务未响应"));
+  }));
+} catch (e) { log("menu setup failed: " + e); }
+
 log("plugin loaded");
