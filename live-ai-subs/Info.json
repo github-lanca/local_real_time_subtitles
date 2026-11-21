@@ -1,0 +1,17 @@
+{
+  "name": "Live AI Subtitles",
+  "identifier": "com.lanca.live-ai-subs",
+  "version": "1.0.0",
+  "author": {
+    "name": "lanca"
+  },
+  "description": "No built-in subtitle? Generate live Chinese subtitles from Japanese audio using local whisper + qwen models.",
+  "entry": "main.js",
+  "permissions": [
+    "show-osd",
+    "video-overlay",
+    "network-request",
+    "file-system"
+  ],
+  "allowedDomains": ["127.0.0.1", "localhost"]
+}

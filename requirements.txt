@@ -1,0 +1,11 @@
+# 运行时依赖（Apple Silicon / macOS，Python 3.12+，实测 3.14.6）
+#
+# 安装：/opt/homebrew/bin/python3 -m pip install -r requirements.txt --user --break-system-packages
+# 国内镜像：加 -i https://mirrors.aliyun.com/pypi/simple/
+mlx-whisper==0.4.3        # 实时 ASR（Apple Metal），0.4.3 是最新版，无 beam search
+mlx>=0.31                 # mlx-whisper 依赖
+onnxruntime>=1.20         # Silero VAD（vad_silero.py 独立使用）
+numpy>=1.26
+
+# 可选：离线交叉验证 / 精修（CPU，非实时，约 6-20s/块）
+faster-whisper==1.2.1
