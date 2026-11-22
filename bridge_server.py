@@ -320,14 +320,61 @@ class _Sidecar:
     def __init__(self, video):
         self.video = video
         base = os.path.splitext(video)[0]
-        self.path = base + ".live-ai.srt"
-        self.ranges_path = base + ".live-ai.ranges"
-        # 旧版本产物：只读兼容，新内容一律写 self.path
+        # 缓存放进视频同目录下的 .live-ai/ 子目录：
+        #   <视频目录>/.live-ai/<视频名>.srt      字幕本体
+        #   <视频目录>/.live-ai/<视频名>.ranges   已处理过的时间区间
+        #
+        # 为什么不能放视频同目录（2026-11-22 实测踩坑）：IINA/mpv 的自动加载是
+        # 文件名**模糊匹配**（字幕名里含视频名就算），原来的 <视频名>.live-ai.srt
+        # 正好命中，被 IINA 当成外挂字幕自动加载并选中（日志里 title="live-ai.srt"
+        # ext=true sel=true）。插件据此判定"用户已经有字幕"跳过 AI 字幕，可缓存
+        # 只覆盖看过的那段（1254s），播到 1600s 之后屏幕全空 —— 用户看到的就是
+        # 「字幕突然没了」。mpv 不会递归扫描子目录，放进 .live-ai/ 就彻底避开。
+        name = os.path.basename(base)
+        self.cache_dir = os.path.join(os.path.dirname(video) or ".", ".live-ai")
+        self.path = os.path.join(self.cache_dir, name + ".srt")
+        self.ranges_path = os.path.join(self.cache_dir, name + ".ranges")
+        # 旧版本产物：只读兼容。.zh.srt 是"导出给手动加载"的成品，保留在视频
+        # 目录（IINA 精确匹配加载它是用户预期行为），这里只迁移会被 IINA 模糊
+        # 匹配命中的 .live-ai.* 缓存。
         self.legacy = [base + ".zh.srt", base + ".zh.srt.part"]
+        self.legacy_live = [base + ".live-ai.srt", base + ".live-ai.ranges"]
         self.cues = []
         self.ranges = []          # [[a, b], ...] 有序且已合并
         self.lock = threading.RLock()
+        self._migrate_legacy()
         self._load()
+
+    def _migrate_legacy(self):
+        """把旧位置（视频同目录）的 .live-ai 缓存搬进 .live-ai/ 子目录。
+
+        必须是"移动"而不是"复制"：原地的副本仍会被 IINA 模糊匹配加载，问题
+        照旧。目标已存在时把旧的改名成 .old 留档（也放在子目录里，不再被扫描），
+        这样既不会丢数据，也不会被 IINA 抢加载。
+        """
+        try:
+            os.makedirs(self.cache_dir, exist_ok=True)
+        except Exception as exc:
+            trace("[srt] mkdir %s failed: %s" % (self.cache_dir, exc))
+            return
+        pairs = [
+            (self.legacy_live[0], self.path),
+            (self.legacy_live[1], self.ranges_path),
+        ]
+        for old, new in pairs:
+            if not os.path.isfile(old):
+                continue
+            try:
+                if os.path.isfile(new):
+                    os.replace(old, new + ".old")
+                    trace("[srt] legacy %s -> %s.old (target exists)"
+                          % (os.path.basename(old), os.path.basename(new)))
+                else:
+                    os.replace(old, new)
+                    trace("[srt] migrated %s -> %s"
+                          % (os.path.basename(old), os.path.basename(new)))
+            except Exception as exc:
+                trace("[srt] migrate %s failed: %s" % (old, exc))
 
     # -- load / save ------------------------------------------------------
     def _load(self):
@@ -351,8 +398,8 @@ class _Sidecar:
                     s, e = _srt_parse_time(a), _srt_parse_time(b)
                     raw_text = " ".join(l.strip() for l in lines[i + 1:]).strip()
                     # 旧文件里可能有 _strip_meta 上线前写进去的脏文本，
-                    # 也可能留着模型没转的假名词
-                    text = _clean_kana(_strip_meta(raw_text))
+                    # 也可能留着模型没转的假名词；符号体系一并收口
+                    text = normalize_punct(_clean_kana(_strip_meta(raw_text)))
                     if text != raw_text:
                         cleaned += 1
                     if (s is None or e is None or not text or e <= s
@@ -420,6 +467,16 @@ class _Sidecar:
                 trace("[srt] rewrote %s (dropped %d, cleaned %d)"
                       % (os.path.basename(self.path), dropped, cleaned))
 
+        # 历史文件里的时间重叠（窗口边界处 CUE_TAIL_PAD 压到下一窗口那条）在载入时
+        # 顺手修掉，否则旧缓存会一直"不连续"下去。改动了才重写，避免每次启动都写盘。
+        if self.cues:
+            before = [(c["start"], c["end"]) for c in self.cues]
+            self._normalize()
+            if [(c["start"], c["end"]) for c in self.cues] != before:
+                self._write()
+                trace("[srt] normalized timeline: %d cue(s) de-overlapped"
+                      % len(self.cues))
+
     def _srt_body(self):
         out = []
         for i, c in enumerate(self.cues, 1):
@@ -430,13 +487,57 @@ class _Sidecar:
     def _write_atomic(self, path, text):
         tmp = path + ".tmp"
         try:
+            # 缓存现在写在 .live-ai/ 子目录里，首次写入时目录可能还不存在。
+            parent = os.path.dirname(path)
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent, exist_ok=True)
             with open(tmp, "w", encoding="utf-8") as f:
                 f.write(text)
             os.replace(tmp, path)
         except Exception as exc:
             trace("[srt] write failed (%s): %s" % (os.path.basename(path), exc))
 
+    def _normalize(self):
+        """整理字幕文件：符号收口 + 时间轴排序去重叠。
+
+        为什么需要（2026-11-22 用户报"字幕文件不连续"）：字幕是边看边累加的，
+        每个 4 秒窗口独立识别。窗口末尾那条 cue 会被 CUE_TAIL_PAD 往后再推 0.5s，
+        正好压到下一窗口开头那条上 —— 实测 SNOS-093 的缓存 381 条里 76 条重叠，
+        文件读起来就是"时间序列不连续"，播放时也会出现两条 cue 同时命中。
+        这里统一修成"后一条不早于前一条结束"：
+          - 前一条够长（≥0.4s）→ 把它的尾巴截到后一条开始；
+          - 前一条太短 → 不动它，把后一条整体往后推（保留原时长）。
+        逐条向后处理，改过的后一条会成为下一轮的"前一条"，所以不会留连锁重叠。
+
+        另外顺带把每条 zh 的符号收口一次（只留 ... ? ~）：`_merge_one` 合并相邻
+        条目时可能拼出 " / "，只在 add 入口清洗是兜不住的，写盘前统一再洗一遍，
+        保证文件里永远不出现多余标点。
+        """
+        cleaned = []
+        for c in self.cues:
+            zh = normalize_punct(c.get("zh"))
+            if zh:
+                c["zh"] = zh
+                cleaned.append(c)
+        self.cues = cleaned
+        if len(self.cues) < 2:
+            return
+        MIN_LEN = 0.4
+        self.cues.sort(key=lambda c: c["start"])
+        for i in range(1, len(self.cues)):
+            prev, cur = self.cues[i - 1], self.cues[i]
+            if cur["start"] >= prev["end"] - 0.01:
+                continue
+            cut = cur["start"]
+            if cut - prev["start"] >= MIN_LEN:
+                prev["end"] = round(cut, 2)
+            else:
+                dur = max(cur["end"] - cur["start"], MIN_LEN)
+                cur["start"] = round(prev["end"], 2)
+                cur["end"] = round(cur["start"] + dur, 2)
+
     def _write(self):
+        self._normalize()
         self._write_atomic(self.path, self._srt_body())
         self._write_atomic(self.ranges_path, json.dumps({
             "ranges": [[round(a, 2), round(b, 2)] for a, b in self.ranges]}))
@@ -545,7 +646,8 @@ class _Sidecar:
                 if self._drop_in_window(start, float(start) + float(duration)):
                     changed = True
             for c in cues or []:
-                zh = (c.get("zh") or "").strip()
+                # 写入缓存前统一收口符号：只允许 ... ? ~，其它标点剔除
+                zh = normalize_punct((c.get("zh") or "").strip())
                 try:
                     s = round(float(c["start"]), 2)
                     e = round(float(c["end"]), 2)
@@ -1007,13 +1109,23 @@ def _merge_tiny(cues, min_len=0.5, max_gap=0.35, max_total=3.0, max_chars=26):
 
 
 def _pad_short_cues(cues, start, duration):
-    """Give every cue a readable dwell time without overlapping the next one."""
+    """Give every cue a readable dwell time without overlapping the next one.
+
+    上限是**窗口结束**（start + duration），不是"窗口 + 0.5s"。以前最后一条允许
+    越过窗口边界 0.5s 做尾部补偿，结果正好压到下一窗口开头那条 cue 上 ——
+    SNOS-093 实测 381 条里 76 条重叠，文件时间轴读起来就是"不连续"。
+    跨窗口的同一句话改由插件侧按文本合并（见 main.js 的去重分支）。
+    """
+    win_end = round(float(start) + float(duration), 2)
     for i, c in enumerate(cues):
-        nxt = cues[i + 1]["start"] if i + 1 < len(cues) else start + duration + 0.5
+        nxt = cues[i + 1]["start"] if i + 1 < len(cues) else win_end
         if c["end"] - c["start"] < MIN_CUE_DISPLAY:
             c["end"] = round(min(c["start"] + MIN_CUE_DISPLAY, max(nxt, c["end"])), 2)
         limit = nxt if nxt > c["start"] + 0.05 else c["end"]
         c["end"] = round(min(c["end"] + CUE_TAIL_PAD, max(limit, c["end"])), 2)
+        # 兜底：任何 cue 都不许超出本窗口，保证相邻窗口天然不重叠
+        c["start"] = round(min(max(c["start"], float(start)), win_end), 2)
+        c["end"] = round(min(max(c["end"], c["start"] + 0.05), win_end), 2)
     return cues
 
 
@@ -1049,6 +1161,54 @@ INTERJECTION_RE = re.compile(
 def _normalize_interjection(zh):
     m = INTERJECTION_RE.match((zh or "").strip())
     return m.group(1) + "～" if m else zh
+
+
+# 字幕符号体系（用户 2026-11-22 明确要求）：字幕里**只允许** "..." "?" "~" 三种
+# 符号，其它标点（，。！、；：""''（）【】——· ／ 等）一律剔除，中文正常显示。
+# 注意：这里只做"字符收口"，不改语义；清洗后没有任何文字的条目由调用方丢弃。
+_OMIT_PLACEHOLDER = "\x00"
+_HAS_TEXT_RE = re.compile(r"[0-9A-Za-z\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF]")
+
+
+def normalize_punct(text):
+    """把译文收口到允许的符号集合：只留 ... ? ~，其它标点全部剔除。
+
+    - 省略号：`…` / `……` / 连续点 → `...`
+    - 问号：`？` → `?`
+    - 波浪号：`～` / `〜` → `~`
+    - 汉字、假名、字母、数字、空格保留
+    - 其余标点（，。！、；：引号括号破折号斜杠等）直接删除
+    清洗后若没有任何文字（只剩 ... ? ~ 空格）返回 ""，调用方据此丢弃该条。
+    """
+    s = (text or "").strip()
+    if not s:
+        return ""
+    # 先把省略号占位，避免后面的逐字符过滤把它的点当成"单个点"删掉
+    s = re.sub(r"…+", _OMIT_PLACEHOLDER, s)
+    s = re.sub(r"\.{2,}", _OMIT_PLACEHOLDER, s)
+    s = s.replace("？", "?").replace("～", "~").replace("〜", "~")
+    out = []
+    for ch in s:
+        if ch == _OMIT_PLACEHOLDER:
+            out.append(ch)
+            continue
+        o = ord(ch)
+        if ch == " ":
+            out.append(ch)
+        elif 0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF:   # 汉字
+            out.append(ch)
+        elif 0x3040 <= o <= 0x30FF:                           # 假名
+            out.append(ch)
+        elif o < 128 and ch.isalnum():                        # 字母 / 数字
+            out.append(ch)
+        elif ch in "?~":                                      # 允许的符号
+            out.append(ch)
+        # 其余（标点 / 符号）一律丢弃
+    s = "".join(out).replace(_OMIT_PLACEHOLDER, "...")
+    s = re.sub(r"\s+", " ", s).strip()
+    if not _HAS_TEXT_RE.search(s):
+        return ""
+    return s
 
 
 def _collapse_unit(core):
@@ -1642,8 +1802,19 @@ def process(video, start, duration, context, language="ja"):
         if not cues:
             return done({"ok": False, "ja": ja, "zh": "", "cues": [], "error": "no valid speech"})
         for _c in cues:
-            _c["zh"] = _normalize_interjection(_c["zh"])
+            # 先归一化拟声（啊… → 啊～），再收口符号体系（只留 ... ? ~）
+            _c["zh"] = normalize_punct(_normalize_interjection(_c["zh"]))
+        # 清洗后没有实义的条目（只剩符号/空格）直接丢掉
+        cues = [c for c in cues if c["zh"]]
+        if not cues:
+            return done({"ok": False, "ja": ja, "zh": "", "cues": [], "error": "no valid speech"})
         cues = _merge_tiny(cues)
+        # _merge_tiny 会用 " / " 把相邻短句拼起来，合并后再收口一次符号
+        for _c in cues:
+            _c["zh"] = normalize_punct(_c["zh"])
+        cues = [c for c in cues if c["zh"]]
+        if not cues:
+            return done({"ok": False, "ja": ja, "zh": "", "cues": [], "error": "no valid speech"})
         _pad_short_cues(cues, start, duration)
         return done({"ok": True, "ja": ja, "zh": " ".join(c["zh"] for c in cues), "cues": cues})
 

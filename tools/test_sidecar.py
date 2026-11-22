@@ -148,8 +148,11 @@ def test_meta_filter(m):
         print("  %s keep=%-5s want=%-5s | %s" % (flag, got, want, text[:40]))
     assert ok, "过滤规则不符合预期"
 
-    # 含脏条目的缓存文件：载入时应丢弃、重写，并把那段时间从"已处理"里挖掉
-    print("\n=== 载入时清洗脏缓存 ===")
+    # 含脏条目的缓存文件：载入时应丢弃、重写，并把那段时间从"已处理"里挖掉。
+    # 这里故意按**旧版命名**（视频同目录 film.live-ai.srt）造文件，顺带验证
+    # 2026-11-22 的迁移：旧文件会被移进 .live-ai/ 子目录，否则 IINA 的模糊匹配
+    # 会把它当外挂字幕自动加载，插件就误判"用户已有字幕"跳过 AI。
+    print("\n=== 载入时清洗脏缓存 + 旧位置迁移 ===")
     video = fake_video("dirty")
     base = os.path.splitext(video)[0]
     with open(base + ".live-ai.srt", "w", encoding="utf-8") as f:
@@ -165,7 +168,11 @@ def test_meta_filter(m):
     assert len(sc.cues) == 1, "脏条目应被丢弃"
     assert sc.ranges == [[0.0, 20.0], [25.0, 30.0]], \
         "被丢弃条目占用的区间（20-25）要挖掉，否则永远补不回来"
-    on_disk = open(base + ".live-ai.srt", encoding="utf-8").read()
+    assert ".live-ai" in sc.path and os.path.isfile(sc.path), \
+        "缓存必须落在 .live-ai/ 子目录（.live-ai/ 前缀的路径）"
+    assert not os.path.exists(base + ".live-ai.srt"), \
+        "旧位置的缓存必须被移走，否则 IINA 还会模糊匹配加载它"
+    on_disk = open(sc.path, encoding="utf-8").read()
     assert "可以翻译为" not in on_disk, "磁盘上的文件也要清洗掉"
     print("  磁盘已重写，脏条目消失")
     _, known = sc.lookup(20.0, 4.0)
