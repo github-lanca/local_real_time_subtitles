@@ -15,11 +15,12 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 
-FFMPEG = "/opt/homebrew/bin/ffmpeg"
+FFMPEG = os.environ.get("FFMPEG") or shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
 CJK = re.compile(r"[\u4e00-\u9fff]")
 # 底部字幕带：画面下方 18%（0.82 ~ 1.00），只裁这一条，不整帧识别
 CROP_Y = 0.82

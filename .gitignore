@@ -18,3 +18,9 @@ __pycache__/
 .workbuddy/
 *.wav
 /tmp/
+
+# 生成的字幕缓存含影片台词内容，不进仓库
+*.live-ai.srt
+*.live-ai.ranges
+*.zh.srt
+*.zh.srt.part

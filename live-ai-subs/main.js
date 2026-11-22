@@ -1,6 +1,6 @@
 // Live AI Subtitles - IINA plugin
 // Poll-driven so it works regardless of when file/overlay events fire.
-const { console, core, event, overlay, http, utils, menu } = iina;
+const { console, core, event, overlay, http, utils, menu, subtitle } = iina;
 
 const BRIDGE = "http://127.0.0.1:18182";
 // Where this repo is cloned. $HOME is expanded by bash (unquoted in the exec
@@ -184,6 +184,50 @@ async function hasBurnedInSubs(path, pos) {
   }
 }
 
+// 字幕缓存的状态。缓存是边看边累加的，所以"有文件"不等于"整片都有字幕"——
+// 它只是让已有的部分秒回，缺的部分照常识别再补写回去。
+async function subtitleCacheStatus(path, dur) {
+  try {
+    const url = BRIDGE + "/subtitle?video=" + encodeURIComponent(path) +
+                "&duration=" + (dur > 0 ? dur.toFixed(1) : "0");
+    const r = await http.get(url);
+    const d = JSON.parse(r.text);
+    if (d && d.ok && d.cues > 0) {
+      const pct = (d.coverage != null) ? Math.round(d.coverage * 100) : null;
+      log("subtitle cache: " + d.cues + " cues" +
+          (pct != null ? (", " + pct + "% covered") : "") +
+          (d.gaps && d.gaps.length ? ", " + d.gaps.length + " gap(s)" : ""));
+      return d;
+    }
+    return null;
+  } catch (e) {
+    log("subtitle cache check failed: " + e);
+    return null;
+  }
+}
+
+// 把缓存导出成标准命名的 .zh.srt（缓存本身一直在写，这个只是给手动加载用）。
+async function exportSubtitles(path, dur) {
+  if (!path) return false;
+  try {
+    const r = await http.post(BRIDGE + "/subtitle/finalize", {
+      headers: { "Content-Type": "application/json" },
+      data: { video: path, duration: dur > 0 ? dur : 0 },
+    });
+    const d = JSON.parse(r.text);
+    if (d && d.ok) {
+      log("exported subtitle: " + d.path + " cues=" + d.cues);
+      say("已导出为标准字幕：" + d.path);
+      return true;
+    }
+    log("export skipped: " + ((d && d.error) || "?"));
+    return false;
+  } catch (e) {
+    log("export failed: " + e);
+    return false;
+  }
+}
+
 async function ensureServices() {
   if (await checkBridge()) { servicesReady = true; return true; }
   if (starting) return false;
@@ -242,7 +286,7 @@ async function prefetch(target, myToken) {
   try {
     const r = await http.post(BRIDGE + "/transcribe", {
       headers: { "Content-Type": "application/json" },
-      data: { video: currentVideo, start: target, duration: CHUNK, context: context },
+      data: { video: currentVideo, start: target, duration: CHUNK, context: context, save: true },
     });
     const d = JSON.parse(r.text);
     if (myToken !== token) return;
@@ -265,9 +309,12 @@ async function prefetch(target, myToken) {
         }
       }
       cues.sort((a, b) => a.start - b.start);
+      // 复用自字幕文件的内容不是这一块现听的，不能当下一块的 prompt。
+      if (d.reset_context) context = "";
       // Only sane text may become the next chunk's prompt: a repetition loop
       // ("あらあらあら…") fed back in poisons every following chunk.
       if (d.ja && isSaneJa(d.ja)) context = d.ja.slice(-24);
+      if (d.from_srt) log("REUSE @" + target.toFixed(1) + " (from subtitle file)");
       if (added.length) log("CUE @" + target.toFixed(1) + " segs=" + added.length +
           " span=" + added[0].start.toFixed(1) + "-" + added[added.length - 1].end.toFixed(1) +
           " zh=" + added.map((c) => c.zh).join(" | ").slice(0, 80));
@@ -360,6 +407,12 @@ async function tick() {
             log("skip: burned-in subtitle detected in picture");
             say("画面已有硬字幕，跳过 AI 字幕");
             return;
+          }
+          // 有缓存不是"跳过"的理由：缓存里可能只有某几段，剩下的要现场补。
+          const cache = await subtitleCacheStatus(path, dur);
+          if (cache) {
+            const pct = (cache.coverage != null) ? Math.round(cache.coverage * 100) : 0;
+            say("已有字幕缓存（覆盖 " + pct + "%），缺失部分实时补齐");
           }
           log("auto: no subtitle showing (tracks=" + st.count + " id=" + st.id + ") -> activate");
           await activate(path);   // starts the local services when needed
@@ -475,6 +528,24 @@ try {
     decidedPath = p;
     deactivate("marked as hardsub");
     say("已标记本片有硬字幕，本片不再启用 AI 字幕");
+  }));
+  menu.addItem(menu.item("AI 字幕：字幕缓存状态", () => {
+    const p = currentVideo;
+    if (!p) { say("当前没有播放中的影片"); return; }
+    const dur = core.status.duration || 0;
+    http.get(BRIDGE + "/subtitle?video=" + encodeURIComponent(p) +
+             "&duration=" + (dur > 0 ? dur.toFixed(1) : "0")).then((r) => {
+      const d = JSON.parse(r.text);
+      if (!d || !d.ok) { say("没有字幕缓存"); return; }
+      const pct = (d.coverage != null) ? Math.round(d.coverage * 100) : 0;
+      say("缓存 " + d.cues + " 条，覆盖 " + pct + "%，未覆盖 " +
+          ((d.gaps || []).length) + " 段");
+    }).catch(() => say("服务未响应"));
+  }));
+  menu.addItem(menu.item("AI 字幕：导出为标准字幕文件", () => {
+    const p = currentVideo;
+    if (!p) { say("当前没有播放中的影片"); return; }
+    exportSubtitles(p, core.status.duration || 0);
   }));
   menu.addItem(menu.item("AI 字幕：服务状态", () => {
     http.get(BRIDGE + "/health").then((r) => {

@@ -11,6 +11,7 @@ Runs on 127.0.0.1:18182.  Standard library only.
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -28,7 +29,10 @@ ROOT = os.environ.get("SUBS_ROOT") or os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 WHISPER_URL = "http://127.0.0.1:18180/inference"
 LLAMA_URL = "http://127.0.0.1:18181/v1/chat/completions"
-FFMPEG = "/opt/homebrew/bin/ffmpeg"
+# ffmpeg 路径：环境变量 > PATH > Homebrew 默认位置（换机器克隆时不用改代码）
+FFMPEG = (os.environ.get("FFMPEG")
+          or shutil.which("ffmpeg")
+          or "/opt/homebrew/bin/ffmpeg")
 PORT = 18182
 
 # ASR backend (env ASR_BACKEND overrides):
@@ -76,7 +80,11 @@ _mlx_ready = threading.Event()
 _mlx_error = None
 
 SYS_PROMPT = (
-    "你是中日字幕翻译。规则：只输出一行简体中文，绝不输出日文假名，不加引号、不解释。\n"
+    "你是中日字幕翻译。把输入的日语翻译成一行简体中文。\n"
+    "规则：只输出译文本身，绝不输出日文假名，不加引号、不解释、不评价。\n"
+    "输入来自语音识别，可能有错字、语气词、断句不完整、听不清的地方。\n"
+    "遇到这种情况不要要求澄清、不要说无法翻译——尽最大努力给出最通顺的中文；\n"
+    "实在没有实义就只输出语气词（如「啊～」「嗯～」「呃～」）。\n"
     "示例：\n"
     "输入：ちょっと待って\n输出：等一下\n"
     "输入：気持ちいい\n输出：好舒服\n"
@@ -84,6 +92,8 @@ SYS_PROMPT = (
     "输入：だめ\n输出：不行\n"
     "输入：あっつい\n输出：好热\n"
     "输入：割れちゃうから\n输出：要裂开了\n"
+    "输入：んー、あのね、その\n输出：嗯…那个…\n"
+    "输入：あ、あ、あ\n输出：啊～\n"
 )
 
 # Whisper hallucinates stock closing phrases on silence/music. These carry no
@@ -206,6 +216,28 @@ def film_log(video, kind, vtime, text, extra=""):
         pass
 
 
+UNTRANSLATED_PATH = os.path.join(LOG_DIR, "untranslated.log")
+
+
+def untranslated_log(vtime, ja_text, model_said=""):
+    """识别成功但没译出来的条目。
+
+    单独一个文件，因为这是要人工看的东西：日语原文连着说的时间点，
+    方便对照着纠正识别或者补一条译法。
+    """
+    line = ("%s  T+%s  %s%s"
+            % (time_mod.strftime("%Y-%m-%d %H:%M:%S"), _tfmt(vtime),
+               (ja_text or "").strip()[:120],
+               ("   [模型]: " + (model_said or "").strip()[:60]) if model_said else ""))
+    try:
+        with _log_lock:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            with open(UNTRANSLATED_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except Exception:
+        pass
+
+
 def drop_log(start, reason, ja, zh, vmax, speech, weak):
     """One line per discarded chunk, with the evidence used to decide.
 
@@ -227,6 +259,358 @@ def drop_log(start, reason, ja, zh, vmax, speech, weak):
 # whisper / llama servers are single-instance: serialize all inference requests.
 _lock = threading.Lock()
 _cache = {}
+
+
+# --- 字幕文件侧车（看完一遍，下次直接复用）-----------------------------------
+#
+# 边看边把字幕累加进视频同目录的一个标准 SRT；下次打开同一部片，缓存里有的
+# 区间直接秒回，没有的照常识别并补写回去 —— 也就是"看到哪、补到哪"。
+#
+#   <视频>.live-ai.srt      字幕本身（标准 SRT，随时可打开）
+#   <视频>.live-ai.ranges   已处理过的时间区间（JSON）
+#
+# 用 .live-ai. 而不是 .zh. 命名，是为了避免 IINA 把它当成外挂字幕自动加载，
+# 与 overlay 字幕叠在一起显示。
+# 缓存命中后是否跳过的判据是"这一段处理过没有"（见 _Sidecar._covered），
+# 不是覆盖率 —— 窗口尾部是静音时覆盖率永远到不了高位，而那一块其实早处理过了。
+
+_SRT_TIME = re.compile(r"(\d+):(\d\d):(\d\d)[,.](\d+)")
+
+
+def _srt_time(t):
+    ms = int(round(max(0.0, float(t)) * 1000))
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    s, ms = divmod(ms, 1000)
+    return "%02d:%02d:%02d,%03d" % (h, m, s, ms)
+
+
+def _srt_parse_time(text):
+    m = _SRT_TIME.match(text.strip())
+    if not m:
+        return None
+    h, mi, se, frac = m.groups()
+    return int(h) * 3600 + int(mi) * 60 + int(se) + int(frac.ljust(3, "0")[:3]) / 1000.0
+
+
+def _norm_zh(text):
+    """Compare cue texts ignoring punctuation/elongation marks."""
+    return re.sub(r"[\s，。！？、,.!?…‥・\-~～ー—'\"]+", "", (text or "")).lower()
+
+
+class _Sidecar:
+    """一部影片的字幕缓存：边看边累加，随时可用。
+
+    只要两个文件：
+      <视频>.live-ai.srt      字幕本身（标准 SRT，随时能打开/交给别的播放器）
+      <视频>.live-ai.ranges   已处理过的时间区间（JSON）
+
+    ranges 是关键。光有 SRT 只能证明"有对白的地方处理过"，无法区分"这段是静音"
+    和"这段还没看"；记下范围之后，第二遍播放才能对空白窗口也直接作答，而不必每次
+    都跑一遍 ffmpeg 去确认没人说话。
+
+    写入一律是"内存全量重写"：几千行亚毫秒级，换来去重/排序/编号在重启后天然正确，
+    也不需要维护"写到第几条"这种状态。
+    """
+
+    def __init__(self, video):
+        self.video = video
+        base = os.path.splitext(video)[0]
+        self.path = base + ".live-ai.srt"
+        self.ranges_path = base + ".live-ai.ranges"
+        # 旧版本产物：只读兼容，新内容一律写 self.path
+        self.legacy = [base + ".zh.srt", base + ".zh.srt.part"]
+        self.cues = []
+        self.ranges = []          # [[a, b], ...] 有序且已合并
+        self.lock = threading.RLock()
+        self._load()
+
+    # -- load / save ------------------------------------------------------
+    def _load(self):
+        src = self.path if os.path.isfile(self.path) else next(
+            (f for f in self.legacy if os.path.isfile(f)), None)
+        dropped = 0
+        cleaned = 0
+        dropped_spans = []
+        if src:
+            try:
+                with open(src, encoding="utf-8", errors="ignore") as f:
+                    blocks = f.read().replace("\r\n", "\n").split("\n\n")
+                for blk in blocks:
+                    lines = [l for l in blk.split("\n") if l.strip()]
+                    if len(lines) < 2:
+                        continue
+                    i = 1 if lines[0].strip().isdigit() else 0
+                    if i >= len(lines) or "-->" not in lines[i]:
+                        continue
+                    a, b = lines[i].split("-->", 1)
+                    s, e = _srt_parse_time(a), _srt_parse_time(b)
+                    raw_text = " ".join(l.strip() for l in lines[i + 1:]).strip()
+                    # 旧文件里可能有 _strip_meta 上线前写进去的脏文本
+                    text = _strip_meta(raw_text)
+                    if text != raw_text:
+                        cleaned += 1
+                    if (s is None or e is None or not text or e <= s
+                            or not _valid_zh(text)):
+                        dropped += 1
+                        if e is not None and s is not None and e > s:
+                            dropped_spans.append([round(s, 2), round(e, 2)])
+                        continue
+                    self.cues.append({"start": round(s, 2), "end": round(e, 2),
+                                      "zh": text})
+                self.cues.sort(key=lambda c: c["start"])
+                if self.cues:
+                    trace("[srt] loaded %d cues from %s"
+                          % (len(self.cues), os.path.basename(src)))
+            except Exception as exc:
+                trace("[srt] load failed: %s" % exc)
+
+        try:
+            if os.path.isfile(self.ranges_path):
+                with open(self.ranges_path, encoding="utf-8") as f:
+                    raw = json.load(f).get("ranges") or []
+                self.ranges = sorted([[float(a), float(b)] for a, b in raw])
+            elif self.cues:
+                # 旧产物没有范围文件时，只能相信"有字幕的地方处理过"。
+                # 绝不能假设"0 到最后一句话都处理过" —— 用户可能只看了中间一段，
+                # 那样会把没处理过的空白区永久标成"已完成"，那段对白再也补不回来
+                # （实测：片头 20-55 秒有完整对白，却因为这条假设被跳过了）。
+                # 间隔 2 秒内合并：对白之间的停顿不值得重跑，长段静音才留空。
+                spans = sorted([[c["start"], c["end"]] for c in self.cues])
+                merged = []
+                for a, b in spans:
+                    if merged and a - merged[-1][1] <= 2.0:
+                        merged[-1][1] = max(merged[-1][1], b)
+                    else:
+                        merged.append([a, b])
+                self.ranges = [[round(a, 2), round(b, 2)] for a, b in merged]
+                trace("[srt] derived %d range(s) from %d cue(s) (no ranges file)"
+                      % (len(self.ranges), len(self.cues)))
+        except Exception as exc:
+            trace("[srt] ranges load failed: %s" % exc)
+
+        # 脏条目被丢掉后，它占的那段时间也要从"已处理"里挖掉，否则下次
+        # 会被当成"这段没对白"直接跳过，永远补不回来。
+        for a, b in dropped_spans:
+            self._subtract_range(a, b)
+
+        # 两件事都靠一次重写完成：
+        #   1) 旧缓存里可能存着修复前写进去的脏条目（模型的拒绝话术），丢掉后
+        #      必须把文件一起改干净，否则它下次还会被读出来。
+        #   2) 从旧产物迁移时要立刻写成新命名，否则 _sync_disk 会以为
+        #      "缓存文件不存在"，把刚读进来的内容又清掉。
+        if dropped or cleaned or ((self.cues or self.ranges) and not os.path.isfile(self.path)):
+            if dropped or cleaned or self.cues or self.ranges:
+                self._write()
+                trace("[srt] rewrote %s (dropped %d, cleaned %d)"
+                      % (os.path.basename(self.path), dropped, cleaned))
+
+    def _srt_body(self):
+        out = []
+        for i, c in enumerate(self.cues, 1):
+            out.append("%d\n%s --> %s\n%s\n"
+                       % (i, _srt_time(c["start"]), _srt_time(c["end"]), c["zh"]))
+        return "\n".join(out)
+
+    def _write_atomic(self, path, text):
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp, path)
+        except Exception as exc:
+            trace("[srt] write failed (%s): %s" % (os.path.basename(path), exc))
+
+    def _write(self):
+        self._write_atomic(self.path, self._srt_body())
+        self._write_atomic(self.ranges_path, json.dumps({
+            "ranges": [[round(a, 2), round(b, 2)] for a, b in self.ranges]}))
+
+    def _sync_disk(self):
+        """文件被外部删掉时，内存状态要跟着清空。"""
+        if self.cues and not os.path.isfile(self.path):
+            trace("[srt] cache file gone, resetting %s"
+                  % os.path.basename(self.video))
+            self.cues = []
+            self.ranges = []
+
+    # -- content ----------------------------------------------------------
+    def _subtract_range(self, a, b):
+        """把 [a, b] 从已处理区间里挖掉（脏条目被丢弃时用）。"""
+        out = []
+        for x, y in self.ranges:
+            if y <= a or x >= b:
+                out.append([x, y])
+                continue
+            if x < a:
+                out.append([x, a])
+            if y > b:
+                out.append([b, y])
+        self.ranges = out
+
+    def _merge_ranges(self, start, end):
+        iv = sorted(self.ranges + [[float(start), float(end)]])
+        out = []
+        for a, b in iv:
+            if out and a <= out[-1][1] + 0.05:
+                out[-1][1] = max(out[-1][1], b)
+            else:
+                out.append([a, b])
+        self.ranges = out
+
+    def _drop_in_window(self, start, end):
+        """清掉"基本落在本窗口内"的旧条目。
+
+        重新识别一段时（区间被挖掉过、或换了提示词重跑），旧结果必须让位，
+        否则新旧两份并存：屏幕上显示旧的，文件里还多一条重复的。
+        判定用重叠比例而不是完全包含——字幕尾部会被 CUE_TAIL_PAD 撑出窗口。
+        """
+        lo, hi = float(start), float(end)
+        keep, removed = [], 0
+        for c in self.cues:
+            span = max(c["end"] - c["start"], 0.01)
+            overlap = min(c["end"], hi) - max(c["start"], lo)
+            if overlap > 0 and overlap / span >= 0.7:
+                removed += 1
+                continue
+            keep.append(c)
+        if removed:
+            self.cues = keep
+        return removed > 0
+
+    def _merge_one(self, s, e, zh):
+        """把一条字幕并进缓存；相邻窗口会重复识别同一句。"""
+        key = _norm_zh(zh)
+        for old in self.cues:
+            overlap = min(e, old["end"]) - max(s, old["start"])
+            if overlap <= 0:
+                continue
+            shorter = min(e - s, old["end"] - old["start"])
+            if shorter <= 0:
+                continue
+            old_key = _norm_zh(old["zh"])
+            same = key == old_key or key in old_key or old_key in key
+            if same and overlap / shorter >= 0.6:
+                old["start"] = round(min(old["start"], s), 2)
+                old["end"] = round(max(old["end"], e), 2)
+                if len(zh) > len(old["zh"]):
+                    old["zh"] = zh
+                return True
+        self.cues.append({"start": s, "end": e, "zh": zh})
+        return True
+
+    def add(self, cues, start=None, duration=None):
+        """并入这一块的识别结果，同时登记"这个窗口已经处理过"。
+
+        即使这一块没有字幕（静音/音乐），也要记 ranges —— 否则第二遍播放还得重新
+        跑一遍 ffmpeg 才能确认它确实没人说话。
+        """
+        with self.lock:
+            self._sync_disk()
+            marked = start is not None and duration
+            changed = False
+            if marked:
+                self._merge_ranges(start, float(start) + float(duration))
+                # 这一段要重新识别了：旧结果先让位，避免新旧并存
+                if self._drop_in_window(start, float(start) + float(duration)):
+                    changed = True
+            for c in cues or []:
+                zh = (c.get("zh") or "").strip()
+                try:
+                    s = round(float(c["start"]), 2)
+                    e = round(float(c["end"]), 2)
+                except Exception:
+                    continue
+                if not zh or e - s < 0.05:
+                    continue
+                if self._merge_one(s, e, zh):
+                    changed = True
+            if changed:
+                self.cues.sort(key=lambda c: c["start"])
+            if changed or marked:
+                self._write()
+            return changed
+
+    def _covered(self, start, end):
+        """[start, end] 是否整段落在"已处理"区间内。"""
+        t = float(start) - 0.3
+        limit = float(end) + 0.3
+        for a, b in self.ranges:
+            if a - 0.3 <= t <= b + 0.3:
+                if b > t:
+                    t = b
+                if t + 0.3 >= limit:
+                    return True
+            elif a - 0.3 > t:
+                break
+        return t + 0.3 >= limit
+
+    def lookup(self, start, duration):
+        """这一段缓存里已经知道什么：(窗口内的 cue, 是否已处理过)。
+
+        只看"cue 覆盖率"是不够的：窗口尾部是静音时覆盖率永远到不了高位，
+        而这一块其实早就处理过了。
+        """
+        end = float(start) + float(duration)
+        with self.lock:
+            hit = [dict(c) for c in self.cues
+                   if c["start"] < end and c["end"] > start]
+            return hit, self._covered(start, end)
+
+    def status(self, duration=0.0):
+        with self.lock:
+            self._sync_disk()
+            covered = sum(b - a for a, b in self.ranges)
+            cov = round(min(1.0, covered / duration), 3) if duration > 0 else None
+            gaps = []
+            if duration > 0:
+                prev = 0.0
+                for a, b in self.ranges:
+                    if a - prev > 3.0:
+                        gaps.append([round(prev, 1), round(a, 1)])
+                    prev = max(prev, b)
+                if duration - prev > 3.0:
+                    gaps.append([round(prev, 1), round(float(duration), 1)])
+            return {
+                "path": self.path,
+                "ranges_path": self.ranges_path,
+                "exists": os.path.isfile(self.path),
+                "cues": len(self.cues),
+                "last": round(max((c["end"] for c in self.cues), default=0.0), 2),
+                "covered_seconds": round(covered, 1),
+                "coverage": cov,
+                "gaps": gaps[:10],
+            }
+
+    def finalize(self, duration=0.0, force=False):
+        """导出成标准命名的 .zh.srt（缓存本身一直在写，这个只是给手动加载用）。"""
+        with self.lock:
+            self._sync_disk()
+            if not self.cues:
+                return {"ok": False, "error": "no cues yet"}
+            base = os.path.splitext(self.video)[0]
+            dst = base + ".zh.srt"
+            self._write_atomic(dst, self._srt_body())
+            covered = sum(b - a for a, b in self.ranges)
+            cov = round(min(1.0, covered / duration), 3) if duration > 0 else 1.0
+            trace("[srt] exported %s (%d cues)" % (os.path.basename(dst), len(self.cues)))
+            return {"ok": True, "path": dst, "cues": len(self.cues), "coverage": cov}
+
+
+# 最近一次翻译被拒时模型的原话（只用于日志，不参与判断）
+LAST_TRANSLATE_RAW = [""]
+
+_sidecars = {}
+_sidecars_lock = threading.Lock()
+
+
+def get_sidecar(video):
+    with _sidecars_lock:
+        sc = _sidecars.get(video)
+        if sc is None:
+            sc = _Sidecar(video)
+            _sidecars[video] = sc
+        return sc
 
 
 def health_check(port):
@@ -799,41 +1183,150 @@ def whisper_transcribe(wav_path, context="", language="ja", speech_sec=None, vad
 
 CJK_IDEOGRAPH = re.compile(r"[\u4e00-\u9fff]")
 KANA_CHAR = re.compile(r"[ぁ-ゖァ-ヺ]")
+# 纯拉丁字母/数字的短译文是合法的：日语里的外来语（バイバイ → byebye、OK）
+# 本来就该原样保留，硬转成中文反而失真。
+LATIN_ONLY = re.compile(r"^[A-Za-z0-9\s'’.,!?…&%/:;\-]+$")
+EN_REFUSAL = re.compile(r"sorry|cannot|can't|unable|as an ai|i'?m not|please provide", re.I)
+KANA_RUN = re.compile(r"[ぁ-ゖァ-ヺー]+")
+
+# 译文里残留的假名多半是模型保留的**专名/昵称**（`果然我就是ダメくん` 其实译对了，
+# 只是「ダメくん」没转）。整条丢掉是最差的选择：屏幕上什么都没有，观众还得猜。
+# 这里先把常见词换掉；换不掉的短专名允许留着（见 _valid_zh）。
+KANA_FIX = [
+    ("ダメくん", "废柴君"), ("だめくん", "废柴君"),
+    ("ダメ", "不行"), ("だめ", "不行"),
+    ("ヤバい", "糟了"), ("やばい", "糟了"), ("ヤバ", "糟"),
+    ("バカ", "笨蛋"), ("ばか", "笨蛋"),
+    ("スケベ", "色鬼"), ("エロい", "色情"),
+    ("ありがとう", "谢谢"), ("ごめん", "对不起"),
+    ("すみません", "不好意思"), ("オッケー", "好的"),
+    ("まあまあ", "算了算了"), ("まあ", "嘛"),
+    ("えーと", "那个"), ("えっと", "那个"),
+    ("ちゃん", "酱"), ("チャン", "酱"),
+    ("くん", "君"), ("クン", "君"),
+    ("さん", "桑"), ("サン", "桑"),
+]
+
+
+def _clean_kana(zh):
+    """把译文里残留的假名词换成中文，换不掉的留着（专名）。"""
+    out = zh or ""
+    for jp, cn in KANA_FIX:
+        out = out.replace(jp, cn)
+    return out
+
+
+# 小模型偶尔会对内容"讲道理"而不是翻译，把说明文字当成译文吐出来。实测原样
+# 上屏过一整句："对不起，这句话包含了一些不合适的表达方式，我将重新翻译一句
+# 更合适的句子：你生气了"。
+META_ZH = re.compile(
+    r"(重新翻译|不合适的表达|不合适的内容|不清晰的发音|发音和语气|"
+    r"无法直接翻译|没办法翻译|无法翻译|不能翻译|"
+    r"作为\s*AI|作为人工智能|语言模型|"
+    r"我无法(直接)?(提供|回答|协助|判断|确定)|我不能(提供|回答|协助)|"
+    r"抱歉[，,]\s*(我|这)|请注意[，,]|该内容|这段内容|"
+    r"如果你有明确的|可以提供给我|很乐意帮你|请提供更多|需要更多上下文)")
+
+# 台词里出现"翻译/译文"本身就极罕见，再叠加拒绝语气才算模型在讲道理。
+_META_WORD = re.compile(r"翻译|译文|原文")
+
+
+def _is_meta(zh):
+    """模型在"讲怎么翻译"，而不是在翻译。
+
+    "翻译"这两个字出现在中文字幕里几乎只可能是元话术（日语台词里极少说
+    「翻訳」），所以只要出现就判掉——除非整句就是这个词本身。被误杀的原文
+    仍然会写进 untranslated.log，不会静默丢失。
+    """
+    if not zh:
+        return False
+    if META_ZH.search(zh):
+        return True
+    if _META_WORD.search(zh):
+        core = re.sub(r"[\s，。！？、,.!?…：:]+", "", zh)
+        return len(core) > 2
+    return False
+
+# 这类字幕几乎不可能超过这个长度；超过说明模型在解释而不是翻译。
+MAX_SUBTITLE_CHARS = 60
+
+
+# 只有"我要重新译一遍"这类**更正**语里，冒号后面的才是真译文；
+# "这个提议可以翻译为：X" 是模型在解释，X 是它编的，不能当字幕。
+_RETRY_HINT = re.compile(r"重新翻译|更合适|更准确|更正|正确的是")
+
+
+def _strip_meta(zh):
+    """Drop a model's meta commentary, keeping the translation it appended."""
+    if not zh or not _is_meta(zh):
+        return zh
+    if _RETRY_HINT.search(zh):
+        tail = re.split(r"[：:]", zh)[-1].strip()
+        if tail and not _is_meta(tail) and 2 <= len(tail) <= MAX_SUBTITLE_CHARS:
+            return tail
+    return ""
 
 
 def _valid_zh(zh):
-    """Reject translations that came back as Japanese (qwen echoes short lines).
+    """Reject translations that came back as Japanese (qwen echoes short lines)
+    or as the model talking about the content instead of translating it.
 
     Seen live: 割れちゃうから came back as 裂けちゃうから and was displayed.
     """
     if not zh:
         return False
-    if KANA_CHAR.search(zh):
+    if _is_meta(zh) or len(zh) > MAX_SUBTITLE_CHARS:
         return False
+    # 假名：允许短的专名（ダメくん / ちゃん），但整句回吐日文（けちゃうから、
+    # おはようございます）必须拒绝 —— 那是没翻译，不是保留专名。
+    runs = KANA_RUN.findall(zh)
+    if runs:
+        if max(len(r) for r in runs) > 4:
+            return False
+        total = sum(len(r) for r in runs)
+        if total / max(len(zh), 1) > 0.4:
+            return False
     if CJK_IDEOGRAPH.search(zh):
+        return True
+    if LATIN_ONLY.match(zh) and len(zh) <= 24 and not EN_REFUSAL.search(zh):
         return True
     # pure interjections (啊～ / 嗯～) are fine without ideographs
     return re.fullmatch(r"[啊呀嗯哈呜哦诶哎呀咿嘿呼唔呃哎唉～~…\s!！?？]+", zh) is not None
 
 
 def translate(ja_text):
-    out = _translate_once(ja_text)
+    raw = _translate_once(ja_text)
+    out = _clean_kana(_strip_meta(raw))
     if _valid_zh(out):
         return out
+    if raw and raw != out:
+        trace("[tr] model talked instead of translating: %s" % raw.strip()[:90])
     # One strict retry, then give up: a Japanese line under Chinese subtitles is
     # worse than a missing line.
-    retry = _translate_once(ja_text, strict=True)
-    return retry if _valid_zh(retry) else ""
+    # 提高温度后结果有随机性（实测 4 次里 3 次能译出），所以给两个采样点。
+    last_raw = raw
+    for temp in (0.3, 0.6):
+        retry_raw = _translate_once(ja_text, strict=True, temp=temp)
+        last_raw = retry_raw or last_raw
+        retry = _clean_kana(_strip_meta(retry_raw))
+        if _valid_zh(retry):
+            return retry
+    LAST_TRANSLATE_RAW[0] = (last_raw or "").strip()
+    return ""
 
 
-def _translate_once(ja_text, strict=False):
+def _translate_once(ja_text, strict=False, temp=None):
     payload = {
         "model": "qwen",
         "messages": [
-            {"role": "system", "content": SYS_PROMPT + ("只能输出简体中文，绝对不要输出日文假名。" if strict else "")},
+            {"role": "system", "content": SYS_PROMPT + (
+                "只输出简体中文，绝对不要输出日文假名，不要把原文照抄一遍。"
+                if strict else "")},
             {"role": "user", "content": ja_text},
         ],
-        "temperature": 0,
+        # strict 重试要离开 temperature=0：3B 模型在 0 下遇到口语噪声会退化成
+        # "复制输入"（实测输出 `啊～まあまあまあ、おもちゃの方が…` 原样照抄）。
+        "temperature": temp if temp is not None else (0.3 if strict else 0),
         "max_tokens": 200,
         "stream": False,
     }
@@ -852,13 +1345,44 @@ def process(video, start, duration, context, language="ja"):
     _t0 = time_mod.time()
     _st = {"extract": 0.0, "vad": 0.0, "asr": 0.0, "tr": 0.0, "tr_n": 0}
 
+    # 字幕缓存里已经有这一段：直接返回，连音频都不抽
+    # （省掉 ffmpeg + VAD + ASR + 翻译）。缓存是边看边累加的，所以"看多少补多少"，
+    # 没看过的区间自然回到下面的识别路径。
+    try:
+        reused, known = get_sidecar(video).lookup(start, duration)
+    except Exception:
+        reused, known = [], False
+
+    if known:
+        if reused:
+            trace("[srt] cache hit @%7.1f %d cues %.3fs"
+                  % (start, len(reused), time_mod.time() - _t0))
+            film_log(video, "复用", start,
+                     "字幕缓存已有：%s" % " / ".join(c["zh"] for c in reused)[:60])
+            return {"ok": True, "ja": "", "zh": " ".join(c["zh"] for c in reused),
+                    "cues": reused, "from_srt": True,
+                    # 复用的内容不是这一块现听的，别让它变成下一块的 prompt。
+                    "reset_context": True,
+                    "_dbg": {"total": round(time_mod.time() - _t0, 3), "reuse": 1}}
+        # 这一段处理过、而且没有字幕 -> 当时就判定没有对白，不必再听一遍。
+        trace("[srt] cache hit @%7.1f empty (no dialogue here)" % start)
+        film_log(video, "复用", start, "字幕缓存里这一段没有对白，跳过识别")
+        return {"ok": False, "ja": "", "zh": "", "cues": [], "from_srt": True,
+                "reset_context": True, "error": "silence",
+                "_dbg": {"total": round(time_mod.time() - _t0, 3), "reuse": 1}}
+
     def tr(text):
         _t = time_mod.time()
         try:
-            return translate(text)
+            out = translate(text)
         finally:
             _st["tr"] += time_mod.time() - _t
             _st["tr_n"] += 1
+        if not out and (text or "").strip():
+            # 识别出来了但没译出来：原文写进 untranslated.log，供人工校对。
+            untranslated_log(start, text, LAST_TRANSLATE_RAW[0])
+            film_log(video, "未译", start, text)
+        return out
 
     def done(obj):
         if TRACE:
@@ -1183,10 +1707,39 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(out)
             except Exception as e:
                 self._json({"ok": False, "hardsub": False, "error": str(e)}, 500)
+        elif self.path.startswith("/subtitle"):
+            try:
+                from urllib.parse import urlparse, parse_qs, unquote
+                q = parse_qs(urlparse(self.path).query)
+                video = unquote((q.get("video") or [""])[0])
+                duration = float((q.get("duration") or ["0"])[0])
+                if not video or not os.path.isfile(video):
+                    self._json({"ok": False, "error": "video not found"}, 400)
+                    return
+                out = {"ok": True}
+                out.update(get_sidecar(video).status(duration))
+                self._json(out)
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)}, 500)
         else:
             self._json({"error": "not found"}, 404)
 
     def do_POST(self):
+        if self.path == "/subtitle/finalize":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                req = json.loads(self.rfile.read(length).decode("utf-8"))
+                video = req.get("video", "")
+                if not video or not os.path.isfile(video):
+                    self._json({"ok": False, "error": "video not found"}, 400)
+                    return
+                out = get_sidecar(video).finalize(float(req.get("duration", 0)),
+                                                  bool(req.get("force", False)))
+                self._json(out)
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)}, 500)
+            return
+
         if self.path == "/probe":
             try:
                 length = int(self.headers.get("Content-Length", 0))
@@ -1215,6 +1768,9 @@ class Handler(BaseHTTPRequestHandler):
             duration = float(req.get("duration", 5))
             context = req.get("context", "")
             language = req.get("language", "ja")
+            # Only player traffic persists subtitles: manual probes/tests must not
+            # pollute the film's .srt.
+            save = bool(req.get("save", False))
             if not video or not os.path.isfile(video):
                 self._json({"ok": False, "error": "video not found"}, 400)
                 return
@@ -1232,9 +1788,24 @@ class Handler(BaseHTTPRequestHandler):
                         for old in list(_cache)[:200]:
                             del _cache[old]
                 result = _cache[key]
+                # Persist after the cache read so a cached chunk still lands in
+                # the SRT (a restart replays keys that are still in memory).
+                if save:
+                    try:
+                        # 没有字幕的窗口也要登记：否则第二遍还得重跑 ffmpeg
+                        # 才能确认这一段确实没人说话。
+                        get_sidecar(video).add(result.get("cues") or [],
+                                               start, duration)
+                    except Exception as exc:
+                        trace("[srt] add failed: %s" % exc)
+            # src= 直接告诉你这一块走的是哪条路：
+            #   srt = 字幕文件里找到了，没用音频
+            #   asr = 文件里没有，走的抽取+VAD+识别+翻译
+            src = "srt" if result.get("from_srt") else "asr"
             trace(f"[req] start={start:7.1f} dur={duration:.1f} ctx={len(context)} "
-                  f"cached={cached} lock={t_lock:.2f} {time_mod.time()-t_req:.2f}s "
-                  f"ok={result.get('ok')} err={result.get('error','')} "
+                  f"src={src} cached={cached} lock={t_lock:.2f} "
+                  f"{time_mod.time()-t_req:.2f}s ok={result.get('ok')} "
+                  f"err={result.get('error','')} "
                   f"zh={(result.get('zh') or '')[:60]}")
             self._json(result)
         except Exception as e:

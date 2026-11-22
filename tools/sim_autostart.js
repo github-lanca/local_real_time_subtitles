@@ -8,7 +8,7 @@ const path = require("path");
 const SRC = path.join(__dirname, "..", "live-ai-subs", "main.js");
 
 function makeEnv(scenario) {
-  const calls = { osd: [], setContent: [], exec: [], post: [], logs: [], menu: [], healthLeft: scenario.healthDown || 0 };
+  const calls = { osd: [], setContent: [], exec: [], post: [], logs: [], menu: [], loadTrack: [], finalize: [], healthLeft: scenario.healthDown || 0 };
   const status = Object.assign(
     { idle: false, url: "file:///tmp/movie.mp4", position: 0, duration: 0, speed: 1, isNetworkResource: false },
     scenario.status || {}
@@ -32,6 +32,16 @@ function makeEnv(scenario) {
       },
       http: {
         get: async (url) => {
+          if (String(url).indexOf("/subtitle?") >= 0) {
+            return { text: JSON.stringify({
+              ok: true,
+              path: "/tmp/film.live-ai.srt",
+              exists: !!scenario.savedSub,
+              cues: scenario.savedSub ? 120 : 0,
+              coverage: scenario.savedSub ? 0.42 : 0,
+              gaps: scenario.savedSub ? [[1800, 7200]] : [],
+            }) };
+          }
           if (String(url).indexOf("/hardsub") >= 0) {
             calls.hardsubQueries = (calls.hardsubQueries || 0) + 1;
             return { text: JSON.stringify({ ok: true, hardsub: !!scenario.hardsub, samples: [] }) };
@@ -40,10 +50,15 @@ function makeEnv(scenario) {
           return { text: JSON.stringify({ ok: true, whisper: true, llama: true }) };
         },
         post: async (url, opts) => {
+          if (String(url).indexOf("/subtitle/finalize") >= 0) {
+            calls.finalize.push(opts.data);
+            return { text: JSON.stringify({ ok: true, path: "/tmp/film.zh.srt", cues: 120, coverage: 0.99 }) };
+          }
           calls.post.push(opts.data);
           return { text: JSON.stringify({ ok: true, ja: "テスト", zh: "测试", cues: [{ start: opts.data.start + 0.5, end: opts.data.start + 1.5, zh: "测试" }] }) };
         },
       },
+      subtitle: { loadTrack: (p) => calls.loadTrack.push(p) },
       utils: { exec: (file, args) => { calls.exec.push([file].concat(args || [])); return { status: 0 }; } },
       menu: {
         item: (title, action, opts) => ({ title, action, opts }),
@@ -61,6 +76,7 @@ function loadTick() {
   src = src.replace(/setInterval\(\(\) => \{/, "globalThis.__tickWrap = (() => {");
   src = src.replace(/\}, TICK_MS\);/, "});");
   src += "\nglobalThis.__runTick = () => { globalThis.__n = (globalThis.__n||0)+1; __tickWrap(); };";
+  src += "\nglobalThis.__dbg = () => ({ active: active, next: nextTarget });";
   return src;
 }
 
@@ -87,6 +103,7 @@ async function run(scenario, ticks, label, delay) {
   console.log("  日志: " + calls.logs.filter((l) => /auto:|skip:|new file|ACTIVE/.test(l)).join(" | "));
   console.log("  启动服务: " + started + "   AI 字幕激活: " + active + "   请求数: " + calls.post.length);
   if (calls.menu.length) console.log("  菜单项: " + calls.menu.join(" | "));
+  if (calls.loadTrack.length) console.log("  加载字幕轨: " + calls.loadTrack.join(", "));
   return { started, active, calls };
 }
 
@@ -152,7 +169,28 @@ async function run(scenario, ticks, label, delay) {
     { status: { position: 1.4 } },
   ], "F 画面有硬字幕");
 
-  const ok = a.active && !b.active && c.active && !d.active && e.started && e.active && !f.active;
+  // G) 字幕缓存只覆盖了一部分 -> 仍然要接管，缺失区间靠管线补齐
+  const g = await run({ savedSub: true }, [
+    {},
+    { status: { duration: 7200, position: 0.3 } },
+    { status: { position: 0.6 } },
+    { status: { position: 1.0 } },
+    { status: { position: 1.4 } },
+    { status: { position: 1.8 } },
+  ], "G 有部分字幕缓存 -> 仍接管补齐");
+
+  // G 的关键：有缓存也必须接管（缓存可能只覆盖某几段），且不去改字幕轨
+  const ok = a.active && !b.active && c.active && !d.active && e.started && e.active &&
+             !f.active && g.active && g.calls.loadTrack.length === 0 &&
+             g.calls.post.length > 0;
+  if (!ok) {
+    console.log("\n=== 失败明细 ===");
+    console.log("  a.active=" + a.active + " !b=" + !b.active + " c=" + c.active +
+                " !d=" + !d.active + " e=" + (e.started && e.active) +
+                " !f=" + !f.active + " g.active=" + g.active +
+                " g.track=" + g.calls.loadTrack.length +
+                " g.post=" + g.calls.post.length);
+  }
   console.log("\n结果: " + (ok ? "PASS" : "FAIL"));
   process.exit(ok ? 0 : 1);
 })();
