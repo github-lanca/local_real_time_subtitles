@@ -12,11 +12,23 @@ ROOT="${SUBS_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 LOGDIR="$ROOT/logs"
 mkdir -p "$LOGDIR"
 
+# IINA 插件通过 utils.exec 调用本脚本时，子进程环境里**没有 HOME**（2026-11-22 实测
+# env 只剩 LC_ALL）。mlx / huggingface 的缓存路径、python 的 ~ 展开都依赖家目录，
+# 缺失时会走 passwd 回退（大概率没事，但行为和终端里不一致，出问题极难排查），
+# 这里显式补回来；$(echo ~) 在 HOME 缺失时由 bash 查 passwd 展开。
+export HOME="${HOME:-$(echo ~)}"
+
 # Default ASR is mlx (in-process, Apple Metal, most accurate + fastest).
 export ASR_BACKEND="${ASR_BACKEND:-mlx}"
 
+# 端口探测必须用绝对路径：IINA 插件 exec 出来的进程 PATH 是
+# /usr/gnu/bin:/usr/local/bin:/bin:/usr/bin:.（实测，**不含 /usr/sbin**），
+# 直接调 lsof 会 command not found -> 判成"端口没被监听" -> 明明服务在跑还重复
+# 启动一份，bridge.log 里刷 "OSError: [Errno 48] Address already in use"。
+LSOF="/usr/sbin/lsof"
+[ -x "$LSOF" ] || LSOF="$(command -v lsof)"
 listening() {
-  lsof -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | grep -q LISTEN
+  "$LSOF" -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | grep -q LISTEN
 }
 
 py="/opt/homebrew/bin/python3"

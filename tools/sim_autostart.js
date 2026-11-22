@@ -28,6 +28,7 @@ function makeEnv(scenario) {
       event: { on: () => 0 },
       overlay: {
         simpleMode: () => {}, setStyle: () => {}, show: () => {},
+        hide: () => {}, setClickable: () => {},
         setContent: (h) => calls.setContent.push(h),
       },
       http: {
@@ -59,7 +60,14 @@ function makeEnv(scenario) {
         },
       },
       subtitle: { loadTrack: (p) => calls.loadTrack.push(p) },
-      utils: { exec: (file, args) => { calls.exec.push([file].concat(args || [])); return { status: 0 }; } },
+      utils: { exec: (file, args) => {
+        calls.exec.push([file].concat(args || []));
+        // scanUserSubs 用 ls -1 列视频目录；按场景返回假的文件列表
+        if (scenario.dirFiles && args && String(args[1] || "").indexOf("ls -1") >= 0) {
+          return { status: 0, stdout: scenario.dirFiles.join("\n") };
+        }
+        return { status: 0 };
+      } },
       menu: {
         item: (title, action, opts) => ({ title, action, opts }),
         addItem: (it) => calls.menu.push(it.title),
@@ -179,17 +187,75 @@ async function run(scenario, ticks, label, delay) {
     { status: { position: 1.8 } },
   ], "G 有部分字幕缓存 -> 仍接管补齐");
 
+  // H) 暂停 -> 应越过 LEAD 预算持续往后补全（目的：暂停时把整片字幕跑出来）
+  const pausedTicks = [];
+  for (let i = 0; i < 12; i++) pausedTicks.push({ status: { position: 100, paused: true } });
+  const h = await run({}, [
+    {},
+    { status: { duration: 5400, position: 100 } },
+    { status: { position: 100 } },
+    { status: { position: 100 } },
+  ].concat(pausedTicks), "H 暂停 -> 后台补全");
+
+  // I) 补全途中恢复播放 -> 必须立刻停止往后啃（把通道让回实时）
+  const hc = h.calls.post.length;
+  const iRes = await run({}, [
+    {},
+    { status: { duration: 5400, position: 100 } },
+    { status: { position: 100 } },
+    { status: { position: 100 } },
+  ].concat(pausedTicks.slice(0, 6)).concat([
+    { status: { position: 100, paused: true } },
+    { status: { position: 100, paused: false } },
+    { status: { position: 100, paused: false } },
+    { status: { position: 100, paused: false } },
+  ]), "I 恢复播放 -> 补全让位");
+
+  // J) 目录里有用户自带的外挂字幕文件（movie.srt）-> 完全不用 AI 字幕
+  //    规则来源（用户 2026-11-22）：先看有没有用户字幕文件，有就不用插件。
+  const j = await run({ dirFiles: ["movie.mp4", "movie.srt"] }, [
+    {},
+    { status: { duration: 5400, position: 0.3 } },
+    { status: { position: 0.6 } },
+    { status: { position: 1.0 } },
+    { status: { position: 1.4 } },
+  ], "J 用户自带外挂字幕 -> 不接管");
+
+  // K) 目录里只有我们自己的 AI 产物（旧缓存/导出成品）-> 仍要接管、继续补齐
+  const k = await run({ dirFiles: ["movie.mp4", "movie.live-ai.srt", "movie.zh.srt", "movie.zh.srt.part"] }, [
+    {},
+    { status: { duration: 5400, position: 0.3 } },
+    { status: { position: 0.6 } },
+    { status: { position: 1.0 } },
+    { status: { position: 1.4 } },
+    { status: { position: 1.8 } },
+  ], "K 只有 AI 字幕产物 -> 仍接管");
+
   // G 的关键：有缓存也必须接管（缓存可能只覆盖某几段），且不去改字幕轨
+  const maxEnd = (calls) => calls.post.reduce((m, d) => Math.max(m, d.start + d.duration), 0);
+  const hEnd = maxEnd(h.calls);
+  const iEnd = maxEnd(iRes.calls);
+  const durations = Array.from(new Set(h.calls.post.map((d) => d.duration)));
+  console.log("  补全最远到: " + hEnd.toFixed(0) + "s（LEAD 预算只有 " + (100 + 12 + 4) +
+              "s）；窗口=" + JSON.stringify(durations) + "；请求数 " + hc);
+  console.log("  恢复播放后最远: " + iEnd.toFixed(0) + "s；请求数 " + iRes.calls.post.length);
+  const fillOK = hEnd > 140 && durations.length === 1 && durations[0] === 4 && hc > 8;
+  // 6 个暂停 tick 最多推到 124；恢复播放的 4 个 tick 不得再往前推进
+  const yieldOK = iEnd <= 128 && iRes.calls.post.length <= 7;
+
   const ok = a.active && !b.active && c.active && !d.active && e.started && e.active &&
              !f.active && g.active && g.calls.loadTrack.length === 0 &&
-             g.calls.post.length > 0;
+             g.calls.post.length > 0 && fillOK && yieldOK &&
+             !j.active && k.active;
   if (!ok) {
     console.log("\n=== 失败明细 ===");
     console.log("  a.active=" + a.active + " !b=" + !b.active + " c=" + c.active +
                 " !d=" + !d.active + " e=" + (e.started && e.active) +
                 " !f=" + !f.active + " g.active=" + g.active +
                 " g.track=" + g.calls.loadTrack.length +
-                " g.post=" + g.calls.post.length);
+                " g.post=" + g.calls.post.length +
+                " fillOK=" + fillOK + " yieldOK=" + yieldOK +
+                " !j=" + !j.active + " k=" + k.active);
   }
   console.log("\n结果: " + (ok ? "PASS" : "FAIL"));
   process.exit(ok ? 0 : 1);
