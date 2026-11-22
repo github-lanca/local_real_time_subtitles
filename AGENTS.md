@@ -74,8 +74,16 @@ overlay.setContent() 按 cue 时间窗渲染浮动字幕
 - **拖动/倍速**：seek 用 `abs(delta - speed*dt) > max(0.7, speed*dt*0.6)` 判定（而非写死阈值）；拖动后 `token++` 丢弃所有在途旧结果；倍速时前瞻量随速度放大；>3x 提示可能延迟。
 - **去重**：插件端 `normText()` 去标点后，6 秒窗口内相同文本只保留一条（防相邻切片重复显示「早上好/早上好。」）。
 - **字幕让位**：每 2 秒复查字幕轨，一旦用户加载字幕即停用 AI 字幕。
-- **自动接管（IINA 一开播就生效）**：轮询发现 `core.status.url` 变化即进入「待判定」状态，(1) 等 duration > 10s 且 `position > 0.15`（或已等 1.5s），(2) 再静置 `SETTLE_MS=600ms` 让 IINA 把内嵌轨道列完，(3) 用 `subtitleState()` 判定：`tracks.length > 0 && (id > 0 || currentTrack)` 才算"有字幕在显示"。没有 → 调 `activate()`（内部 `ensureServices()` 会检查 127.0.0.1:18182，不通就执行 `start_services.sh`）。网络串流直接跳过。判定**每个文件只做一次**（`decidedPath`），避免反复启停。
-- **服务自愈**：连续 4 次请求传输失败 → 认为 bridge 已死，静默重跑 `ensureServices()`（20s 节流）。
+- **自动接管（IINA 一开播就生效）**：轮询发现 `core.status.url` 变化即进入「待判定」状态，(1) 等 duration > 10s 且 `position > 0.15`（或已等 1.5s），(2) 再静置 `SETTLE_MS=600ms` 让 IINA 把内嵌轨道列完，(3) 判定。判定**每个文件只做一次**（`decidedPath`），避免反复启停。
+- **判定顺序（2026-11-22 用户明确要求，别改坏）**：
+  1. `subtitleState()` 显示已有**用户字幕轨**（IINA 已加载并选中，且标题不含 `live-ai`）→ 跳过 AI；
+  2. 网络串流 → 跳过；
+  3. **`scanUserSubs()` 扫视频同目录**：存在 `<视频名>.<任意>.srt|ass|ssa|vtt|sub`（排除 `<视频>.live-ai.*`、`<视频>.zh.srt`、`.part` 这些 AI 产物）→ 跳过 AI，OSD 提示文件名（即使 IINA 这次没自动加载它，也说明用户手里有字幕）；
+  4. `hasBurnedInSubs()` 画面有硬字幕 → 跳过；
+  5. 否则 **走 AI**：`subtitleCacheStatus()` 只用于 OSD 提示（缓存覆盖多少），然后 `activate()`。
+- **AI 缓存的复用语义**：缓存（`.live-ai/<视频名>.srt`）就是"AI 生成的字幕文件"。插件接管后**每一块都先查它**：命中区间的 cue 秒回（0.000s），没命中的才现场识别并回写 → 等价于"先读 AI 字幕，缺的再走实时那一套"；缓存不完整不是跳过的理由。暂停时 `pauseFill` 会一个窗口接一个窗口推到片尾（见 2.6）。
+- `activate()` 内部 `ensureServices()` 会检查 127.0.0.1:18182，不通就执行 `start_services.sh`。
+- **服务自愈（2026-11-22 加固）**：① 播放中连续 4 次请求传输失败 → 认为 bridge 已死，静默重跑 `ensureServices()`（20s 节流）；② 「已决定要 AI 字幕但服务没就绪」时每 30s 后台重试一次（`aiWanted` 标志）。原来只在 activate 时调一次 ensureServices，失败后（例如启动脚本路径错）就**永久空屏**，只有重载插件才恢复——这是用户报"字幕完全不出现"的直接原因之一。
 - **幻觉防护**：四层——① Silero VAD 门禁（无真人声直接不推理，音乐窗 0.3s 返回）② 退化检测（`compression_ratio>4` / 同字符≥6 连 → 有界重试，人声不足则丢弃）③ 幻觉短语黑名单 ④ cue 裁剪到真实发声区间。**Whisper 的 `no_speech_prob` 不可信**（静音上也会给 0.000）。
 
 ---
@@ -84,16 +92,55 @@ overlay.setContent() 按 cue 时间窗渲染浮动字幕
 
 | 文件 | 内容 |
 |---|---|
-| `<视频>.live-ai.srt` | 标准 SRT，边看边更新，不需要"看完"这个状态 |
-| `<视频>.live-ai.ranges` | 已处理过的时间区间（JSON），`[[a,b], ...]` 有序已合并 |
+| `<视频目录>/.live-ai/<视频名>.srt` | 标准 SRT，边看边更新，不需要"看完"这个状态 |
+| `<视频目录>/.live-ai/<视频名>.ranges` | 已处理过的时间区间（JSON），`[[a,b], ...]` 有序已合并 |
 
 - **写入**：每块识别完立刻 `add(cues, start, duration)` —— 内存全量重写两个文件（几千行亚毫秒级），换来去重/排序/编号在重启后天然正确。
 - **空白窗口也登记**：静音窗口没有字幕，但 `ranges` 必须记下来，否则第二遍还要跑 ffmpeg 才能确认它确实没人说话。
 - **复用（`process()` 最前面）**：`lookup()` 返回 `(窗口内 cue, 是否已处理过)`。已处理过 → 有 cue 直接返回（实测 0.000s），没 cue 直接返回 `silence`，一个字节音频都不解码。没处理过 → 正常识别，结果补写回缓存。
 - **判据是"处理过没有"，不是覆盖率**：窗口尾部是静音时覆盖率永远到不了高位（4 秒窗口里说 2 秒＝50%），用覆盖率当判据会把"已处理"误判成"没处理"。
-- **命名用 `.live-ai.` 而不是 `.zh.`**：避免 IINA 把它当外挂字幕自动加载，与 overlay 字幕叠在一起显示。
-- **兼容旧产物**：`_load()` 依次尝试 `.live-ai.srt` → `.zh.srt` → `.zh.srt.part`，读到后立刻写成新命名（迁移）；旧文件没有 ranges 时按"0 到最后一句话都处理过"推断。
+- **必须放在 `.live-ai/` 子目录里（2026-11-22 修正）**：IINA/mpv 的自动加载是**文件名模糊匹配**（字幕名里含视频名就算），原来平铺在视频目录的 `<视频>.live-ai.srt` 会被 IINA 当成外挂字幕自动加载并选中（实测 `core.subtitle.tracks` 里 `title="live-ai.srt", ext=true, sel=true`）→ 插件判定"用户已有字幕"跳过 AI → 而缓存只覆盖看过的部分，播到没覆盖的地方屏幕全空（用户报"字幕掉了"）。mpv 不递归扫子目录，放 `.live-ai/` 后 IINA 再也抢不到。
+- **旧文件迁移**：`_Sidecar._migrate_legacy()` 在构造时把视频目录里的 `<视频>.live-ai.srt/.ranges` **移动**进子目录（不是复制——留在原地的副本仍会被加载）；目标已存在时改名 `.old` 留档。`.zh.srt` 是导出成品，保留在视频目录。
+- **插件侧兜底**：`subtitleState()` 把 title 含 `live-ai` 的字幕轨视为"我们自己的缓存"，不算用户字幕（`isOwnCacheTrack`），防止旧会话/残留文件再次导致跳过。
+- **兼容旧产物**：`_load()` 优先新路径，其次 `.zh.srt` → `.zh.srt.part`；读到后立刻写成新路径；旧文件没有 ranges 时按"0 到最后一句话都处理过"推断。
 - **导出**：`POST /subtitle/finalize` 把缓存复制成标准命名的 `.zh.srt`（给手动加载/别的播放器用）。缓存本身一直在写，这个不是"落盘开关"。
+- **时间轴必须不重叠（2026-11-22 用户报"字幕文件不连续"）**：字幕是每个 4 秒窗口独立识别、累加写盘的。窗口末尾那条 cue 会被 `CUE_TAIL_PAD` 往后推 0.5s，正好压到下一窗口开头那条上——实测 SNOS-093 缓存 381 条里 **76 条重叠**，文件读起来就是"时间序列不连续"，播放时也会两条 cue 同时命中。两处修：
+  - `_pad_short_cues()`：所有 cue 严格限制在 `[start, start+duration]` 窗口内（不再允许"窗口末 +0.5s"），相邻窗口天然不重叠；
+  - `_Sidecar._normalize()`：每次 `_write()` 前（以及 `_load()` 后检测到重叠时）全局整理成"后一条不早于前一条结束"——前一条够长（≥0.4s）就截它的尾巴，太短就把后一条整体后推。历史文件会在 bridge 重启后第一次载入时被整理并重写（实测 398 条 → 重叠 0）。
+  - 插件侧 `prefetch()` 合并时也做同样整理（显示层保险）；同文本的相邻 cue（窗口边界处同一句话被识别两次）改为**合并取时间并集**，不再直接丢弃新的那条。
+  - 验证方法：读缓存 SRT，统计 `cues[i].start < cues[i-1].end` 的条数，应为 0。
+
+### 2.5b 字幕符号体系（用户硬性要求，2026-11-22）
+
+**屏幕上只允许三类符号：`...`（省略号）、`?`（问号）、`~`（波浪号）**；中文/假名/字母/数字正常显示；其它标点（，。！、；：""''（）【】——·／ 等）**一律剔除**，不留、不替换成别的符号。
+
+- 实现：`normalize_punct(text)`（bridge_server.py），规则：
+  - `…` / `……` / 连续点 → `...`；`？` → `?`；`～` / `〜` → `~`；
+  - 逐字符白名单：汉字（含扩展 A）、假名、ASCII 字母数字、空格、`?`、`~` 保留，其余全删；
+  - 清洗后没有任何文字的（只剩 `...?~` 空格）返回空串，由调用方丢弃该条。
+- 调用点（三处，缺一处就会漏）：
+  1. `process()`：生成 cues 后先 `normalize_punct(_normalize_interjection(zh))`，`_merge_tiny` 合并后再洗一遍（合并会拼 `" / "`）；
+  2. `_Sidecar.add()`：写入缓存前；
+  3. `_Sidecar._normalize()`：**每次写盘前**统一洗一遍（`_merge_one` 合并也可能拼出 `/`，只靠 add 入口兜不住）。
+  4. 插件 `cleanPunct()`（main.js）：`prefetch()` 合并时 + `renderAt()` 显示前兜底（旧缓存/旧 bridge 进程也不会漏出标点）。
+- 历史缓存：bridge 重启后首次 `_load` 会清洗并重写（实测 SNOS-093 536 条全部收口，违规字符 0）。
+- 注意：纯数字之间的小数点会被删（`3.5` → `35`），这是"只允许三种符号"的直接结果，属于预期。
+
+### 2.6 暂停补全（scavenge，2026-11-22）
+
+播放时预取只允许领先 `LEAD(12s)`，一暂停就停 —— "看 10 分钟去睡觉"等于字幕文件只有 10 分钟。现在：**暂停后解除 LEAD 限制，一个窗口接一个窗口推到片尾**。
+
+| 状态 | 预取上限 | 窗口 | 请求节奏 |
+|---|---|---|---|
+| 播放中 | `pos + LEAD(12s)` | `CHUNK=4.0` | 单飞，随播放头推进 |
+| 暂停中 | 片尾（`dur-1.5`） | `PAUSE_CHUNK=4.0` | 单飞 + `PAUSE_GAP_MS=200` 间隔 |
+
+- **让位**：`paused` 变 false（恢复播放）或发生 seek → `filling=false`，立刻不再发新窗口；正在进行的那一个跑完为止（≈2s）。已补 cue 留在 `cues` 里，恢复后按时间正常显示。
+- **不重复请求**：恢复播放后 `nextTarget` 领先播放头很多，`nextTarget <= pos+lead+CHUNK` 不满足 → 自然停手，等播放头追上来再继续。
+- **落盘**：走的是同一条 `prefetch(...save:true)`，所以补全内容立即进 `.live-ai.srt`。
+- **开关 / 进度**：菜单「暂停时后台补全（开 / 关）」「补全进度」。
+- **实测（4s vs 6s 窗口，同片 4 个位置）**：6s 耗时 2.9–3.5s，4s 耗时 2.9–3.4s —— 瓶颈是固定开销不是音频长度；但 6s 更容易把重复拟声喂成退化（`うんうんうんうん`，`degenerate=True`）。→ 补全沿用 4s，靠"不停下"提速。
+- **双窗口代价**：bridge 推理全局串行，一路暂停补全时另一路仍在播放会多等约一个窗口（~2s）。临时关菜单开关即可，不必改代码。
 
 ## 3. 模型选型与优缺点
 
@@ -219,11 +266,19 @@ models/
 
 ### 4.5 插件机制类
 
+9a. **插件的视频 overlay 会让 IINA 主窗口拖不动（2026-11-22 用户实测确认）**：IINA 主窗口是"全尺寸内容视图 + 自绘透明标题栏"（二进制里能看到 `PluginOverlayView`/`pluginOverlayViewContainer`/`IINA.Titlebar`），插件 overlay 是**覆盖在内容区顶层的 WKWebView**，而标题栏也在内容区里 → overlay 会吃掉标题栏的 mouseDown，表现就是「点标题栏拖不动窗口」。用户实测：用菜单把「AI 字幕：开/关」切换几次后又能拖了（overlay 状态被重置）。→ 修法（main.js）：
+    - `setupOverlay()` 里显式 `overlay.setClickable(false)`；
+    - **不要常驻 show**：统一走 `overlaySet(text)` —— 有字幕才 `show()+setContent()`，没字幕清空并**延迟 800ms hide**（延迟是为了句子间隙不闪烁）。这样大多数时间鼠标事件都还给 IINA；
+    - 保留菜单「临时隐藏字幕层（排查窗口拖动）」做 A/B 隔离。
+    - 已知残留：字幕正在显示的**那一刻**如果拖标题栏仍可能被挡（IINA 没有 overlay 缩小的 API，webview 始终铺满内容区）。要彻底解决只能等 IINA 上游修 webview 命中测试。
+
 9b. **"IINA 打开文件却不自动出字幕"的真凶是首帧判定**：旧代码在第一次 tick 就判定，此时 `core.status.duration` 还是 0、`core.subtitle.tracks` 还是空数组，条件 `dur > 10` 不成立 → 走 else 分支把 `currentVideo` 标记成"已处理"，**之后永远不再检查这个文件**。→ 改成"待判定 + 静置 + 一次性决策"状态机（见 2.4）。
 9c. **有字幕轨 ≠ 有字幕在显示**：IINA 是否自动选中内嵌轨取决于偏好设置；`tracks.length > 0` 但 `id = -1`/`currentTrack` 为空时，观众眼前什么都没有。→ 判定要用 `tracks.length > 0 && (id > 0 || currentTrack)`，只看轨道数会把这种情况误判成"已有字幕"。
 9d. **不能用按键/AppleScript 触发 IINA 菜单**（沙盒 -10004）。让插件代码生效的办法：IINA → 设置 → 插件 → 选中本插件 → **Reload**，或直接重启 IINA（插件在启动时加载）。
 9e. **`iina-plugin link` 只是符号链接，插件默认不启用**：必须 `defaults write com.colliderli.iina "PluginEnabled.com.lanca.live-ai-subs" -int 1` 后重启 IINA。
 10. **overlay `simpleMode()` 必须在 `iina.window-loaded` 之后调用**，否则抛 "window is not available"。
+10b. **插件热重载后字幕不显示（2026-11-22 真实事故，两个连环 bug）**：`iina.window-loaded` 只在窗口首次加载时触发，**在 IINA 设置里点 Reload 时窗口早已存在，这个事件永远不会再来**。旧代码 `if (overlayReady || !windowReady) return;` 会因此让 `overlayReady` 永远是 false → 插件照常识别、日志有 CUE/RENDER、bridge 有请求，但屏幕上一个字都没有（用户现象："字幕没有显示"）。证据：热重载后 `plugin.log` 里只有 `plugin loaded`，没有 `overlay ready`。→ 修法一：`setupOverlay()` 不依赖事件，未收到 window-loaded 时**每 2 秒主动探测一次** `simpleMode()`（窗口没就绪会抛错，吞掉下次再试），成功即 lock `overlayReady=true`。
+  修完第一个还遇到第二个：**初始化阶段不要调 `overlay.hide()`**。IINA 文档写明 overlay 默认就是隐藏的；在 webview 刚创建时 hide 一下，会让之后的**第一次** `show()` 不渲染内容 → 用户现象是"Reload 后第一段字幕不出，手动切一次「AI 字幕：开/关」（触发第二次 show）才显示"。→ 修法二：初始化只做 `simpleMode/setStyle/setClickable`，显隐全部交给 `overlaySet()`；并且 `overlaySet()` 里**先 `show()` 再 `setContent()`**（隐藏态下 setContent 可能被吞）。日志文案 `overlay ready (default hidden, shows on first cue)` 是这条修法的标记。
 11. **事件时机不可靠**：`iina.file-loaded` 可能在插件注册监听前就触发。→ 改为 `setInterval` 轮询 `core.status.url`。
 12. **重开同文件不出字幕**：idle 分支未清 `currentVideo`；已修。
 13. **`setInterval` 异步重入**：加 `tickRunning` 保护。
@@ -244,6 +299,12 @@ models/
 20b. **detached 进程在本 agent 沙盒里偶发 `execution attempt 不存在或已关闭`**（bridge 报 500）：这是沙盒对"发起它的工具调用已结束"的进程的限制，实测延迟 12s 后调用 ffmpeg 又是正常的，属环境噪声；用户侧由 IINA 启动不受影响。调试期需要 bridge 能稳定调 ffmpeg 时，改用后台任务持有前台进程。
 21. **`iina-plugin pack` 在本环境连续 SIGTERM(137)**：开发期用 link 源码目录加载即可。
 22. **下载慢**：所有下载优先国内镜像——Hugging Face 走 `hf-mirror.com`，GitHub Release 走 `gh-proxy.com`，PyPI 走阿里/USTC。大文件 `curl -L -C -` 续传，下完核对大小/哈希（详见用户级 MEMORY.md）。
+22b. **IINA 插件 `utils.exec` 出来的子进程环境是被裁剪的（2026-11-22 实测，本轮最大坑）**：
+    - **`env` 里没有 `HOME`**（只剩 `LC_ALL`）。所以插件里写 `"$HOME/AI/实时字幕/..."` 的 bash 命令会展开成空串 → 路径变成 `/AI/实时字幕/...` → 启动脚本 exec 失败、日志写不进去，**而且全部静默**。表现：字幕看着看着全没了、之后服务再也拉不起来、`logs/plugin.log` 一片空白（连 "plugin loaded" 都没有）。
+    - 修法：插件里用 `"$(echo ~)/AI/实时字幕"`（HOME 缺失时 bash 回退查 passwd），并给脚本路径加双引号防分词；`start_services.sh` 顶部再 `export HOME="${HOME:-$(echo ~)}"` 兜底。
+    - **`PATH` 是 `/usr/gnu/bin:/usr/local/bin:/bin:/usr/bin:.`，不含 `/usr/sbin`** → 脚本里的 `lsof` 直接 command not found → 端口探测永远"没监听" → 明明服务在跑还重复启动一份，bridge.log 里刷 `OSError: [Errno 48] Address already in use`。修法：`listening()` 用 `/usr/sbin/lsof` 绝对路径。
+    - 排查这类问题**不要只猜**：临时把 `main.js` 换成 10 行探针（`utils.exec` 写 `/tmp`），重启 IINA 就能区分"插件没加载 / 日志写不了 / 逻辑卡住"。实测它一次定位了上面两个结论。
+22c. **插件日志只在下一条日志到来时才 flush**：`log()` 里的 8s 阈值检查依赖"有新日志进来"，一旦插件卡在某个 `await`（`/hardsub`、`utils.exec` 等），内存里最后几条正是卡住前的状态，却永远不落盘 —— 排查时看到的是几分钟前的内容，会误判成"插件根本没跑"。→ 单独 `setInterval(flushLog, 5000)` 兜底。
 
 ---
 
