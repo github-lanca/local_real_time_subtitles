@@ -271,6 +271,10 @@ _cache = {}
 #
 # 用 .live-ai. 而不是 .zh. 命名，是为了避免 IINA 把它当成外挂字幕自动加载，
 # 与 overlay 字幕叠在一起显示。
+# VAD 达到这个概率就认为"这里确实有人说话"。低于它又被丢弃的窗口，多半是音乐/
+# 环境音，标记成已处理可以省下重跑；高于它却没出字幕，则很可能是判定误杀。
+VOICE_CONFIDENT = float(os.environ.get("VOICE_CONFIDENT", "0.60"))
+
 # 缓存命中后是否跳过的判据是"这一段处理过没有"（见 _Sidecar._covered），
 # 不是覆盖率 —— 窗口尾部是静音时覆盖率永远到不了高位，而那一块其实早处理过了。
 
@@ -346,8 +350,9 @@ class _Sidecar:
                     a, b = lines[i].split("-->", 1)
                     s, e = _srt_parse_time(a), _srt_parse_time(b)
                     raw_text = " ".join(l.strip() for l in lines[i + 1:]).strip()
-                    # 旧文件里可能有 _strip_meta 上线前写进去的脏文本
-                    text = _strip_meta(raw_text)
+                    # 旧文件里可能有 _strip_meta 上线前写进去的脏文本，
+                    # 也可能留着模型没转的假名词
+                    text = _clean_kana(_strip_meta(raw_text))
                     if text != raw_text:
                         cleaned += 1
                     if (s is None or e is None or not text or e <= s
@@ -388,6 +393,16 @@ class _Sidecar:
                       % (len(self.ranges), len(self.cues)))
         except Exception as exc:
             trace("[srt] ranges load failed: %s" % exc)
+
+        # 历史文件里会积攒重复句和 0.1 秒碎片（旧逻辑没合并），载入时整理一次，
+        # 免得每次都靠人工清。
+        if self.cues:
+            before = len(self.cues)
+            self.cues = _dedupe_linear(_merge_tiny(self.cues))
+            if len(self.cues) != before:
+                cleaned += before - len(self.cues)
+                trace("[srt] merged %d duplicate/tiny cue(s) on load"
+                      % (before - len(self.cues)))
 
         # 脏条目被丢掉后，它占的那段时间也要从"已处理"里挖掉，否则下次
         # 会被当成"这段没对白"直接跳过，永远补不回来。
@@ -479,35 +494,50 @@ class _Sidecar:
         return removed > 0
 
     def _merge_one(self, s, e, zh):
-        """把一条字幕并进缓存；相邻窗口会重复识别同一句。"""
+        """把一条字幕并进缓存；相邻窗口会重复识别同一句。
+
+        两种重复都要处理：
+          - 时间重叠：同一个窗口边缘被两个块各识别一次；
+          - 时间不重叠但相差 1–2 秒：屏幕上看就是同一句出现两遍（实测 108 处）。
+        """
         key = _norm_zh(zh)
+        nearby = None
         for old in self.cues:
-            overlap = min(e, old["end"]) - max(s, old["start"])
-            if overlap <= 0:
-                continue
-            shorter = min(e - s, old["end"] - old["start"])
-            if shorter <= 0:
-                continue
             old_key = _norm_zh(old["zh"])
             same = key == old_key or key in old_key or old_key in key
-            if same and overlap / shorter >= 0.6:
+            if not same:
+                continue
+            overlap = min(e, old["end"]) - max(s, old["start"])
+            shorter = min(e - s, old["end"] - old["start"])
+            if overlap > 0 and shorter > 0 and overlap / shorter >= 0.6:
                 old["start"] = round(min(old["start"], s), 2)
                 old["end"] = round(max(old["end"], e), 2)
                 if len(zh) > len(old["zh"]):
                     old["zh"] = zh
                 return True
+            if abs(s - old["start"]) <= 2.0 and nearby is None:
+                nearby = old
+        if nearby is not None:
+            nearby["start"] = round(min(nearby["start"], s), 2)
+            nearby["end"] = round(max(nearby["end"], e), 2)
+            if len(zh) > len(nearby["zh"]):
+                nearby["zh"] = zh
+            return True
         self.cues.append({"start": s, "end": e, "zh": zh})
         return True
 
-    def add(self, cues, start=None, duration=None):
-        """并入这一块的识别结果，同时登记"这个窗口已经处理过"。
+    def add(self, cues, start=None, duration=None, mark=True):
+        """并入这一块的识别结果；mark=True 时同时登记"这个窗口已经处理过"。
 
-        即使这一块没有字幕（静音/音乐），也要记 ranges —— 否则第二遍播放还得重新
-        跑一遍 ffmpeg 才能确认它确实没人说话。
+        正常情况下即使没有字幕（静音/音乐）也要记 ranges，否则第二遍还得跑一遍
+        ffmpeg 确认它确实没人说话。
+
+        但 `mark=False` 是给"VAD 很确信有人声、却没能出字幕"的窗口用的：这类很可能是
+        判定误杀（退化/幻觉被丢弃），要留空让下次重试，否则那段对白永远补不回来。
         """
         with self.lock:
             self._sync_disk()
-            marked = start is not None and duration
+            marked = bool(start is not None and duration and mark)
             changed = False
             if marked:
                 self._merge_ranges(start, float(start) + float(duration))
@@ -866,6 +896,13 @@ def _looks_degenerate(text, segments):
     if re.search(r"(.)\1{%d,}" % (DEGENERATE_RUN - 1), core):
         return True
 
+    # 任意位置出现"短单元连续重复 ≥4 次"都算退化。原来的实现只检查**整串**
+    # 是否由同一单元重复构成，遇到"前缀 + 重复词"就漏了 —— 实测
+    # `あかしじゃんなんてパラシュカーパラシュカーパラシュカーパラシュカー`
+    # 被当成正常文本，最后译成 4 个 "parachoker" 上了屏。
+    if re.search(r"(.{1,6}?)\1{3,}", core):
+        return True
+
     n = len(core)
     if n >= DEGENERATE_MIN_LEN:
         for unit in range(1, 6):
@@ -929,6 +966,44 @@ def _group_spans(spans, k):
     if cur:
         groups.append((cur[0][0], cur[-1][1]))
     return groups
+
+
+def _dedupe_linear(cues, near=2.0):
+    """相邻且同文的条目并成一条（只处理已排序列表，O(n)）。"""
+    out = []
+    for c in cues:
+        if out:
+            prev = out[-1]
+            if (abs(c["start"] - prev["start"]) <= near
+                    and _norm_zh(c["zh"]) == _norm_zh(prev["zh"])):
+                prev["end"] = round(max(prev["end"], c["end"]), 2)
+                continue
+        out.append(c)
+    return out
+
+
+def _merge_tiny(cues, min_len=0.5, max_gap=0.35, max_total=3.0, max_chars=26):
+    """把挤在一起的极短字幕并成一条。
+
+    VAD 在快速对白里会切出 0.1–0.2 秒的碎片（实测 115 条 <0.35s），一条一闪而过
+    根本看不清。合并成一屏、文本用 " / " 连接，更接近"一口气说完"的实际观感。
+    """
+    out = []
+    for c in cues or []:
+        c = dict(c)
+        if out:
+            prev = out[-1]
+            short = (prev["end"] - prev["start"] < min_len
+                     or c["end"] - c["start"] < min_len)
+            span = max(c["end"], prev["end"]) - prev["start"]
+            if (short and c["start"] - prev["end"] <= max_gap and span <= max_total
+                    and len(prev["zh"]) + len(c["zh"]) <= max_chars):
+                prev["end"] = round(max(prev["end"], c["end"]), 2)
+                if _norm_zh(c["zh"]) not in _norm_zh(prev["zh"]):
+                    prev["zh"] = prev["zh"] + " / " + c["zh"]
+                continue
+        out.append(c)
+    return out
 
 
 def _pad_short_cues(cues, start, duration):
@@ -1200,6 +1275,9 @@ KANA_FIX = [
     ("スケベ", "色鬼"), ("エロい", "色情"),
     ("ありがとう", "谢谢"), ("ごめん", "对不起"),
     ("すみません", "不好意思"), ("オッケー", "好的"),
+    ("ありがとうございます", "谢谢"), ("お願いします", "拜托了"),
+    ("エステ", "美容"), ("ズボン", "裤子"), ("ズボー", "裤子"),
+    ("お冊子", "小册子"), ("重い", "沉重"), ("ひどい", "过分"),
     ("まあまあ", "算了算了"), ("まあ", "嘛"),
     ("えーと", "那个"), ("えっと", "那个"),
     ("ちゃん", "酱"), ("チャン", "酱"),
@@ -1385,6 +1463,8 @@ def process(video, start, duration, context, language="ja"):
         return out
 
     def done(obj):
+        # 调用方要靠它决定这一个窗口要不要标记"已处理"（见 add(mark=...)）
+        obj["_vmax"] = round(_st.get("vmax", 0.0), 3)
         if TRACE:
             # ja= keeps the raw recognition (120 chars) even for dropped chunks,
             # so "what did it hear, and why was it thrown away" is answerable
@@ -1563,6 +1643,7 @@ def process(video, start, duration, context, language="ja"):
             return done({"ok": False, "ja": ja, "zh": "", "cues": [], "error": "no valid speech"})
         for _c in cues:
             _c["zh"] = _normalize_interjection(_c["zh"])
+        cues = _merge_tiny(cues)
         _pad_short_cues(cues, start, duration)
         return done({"ok": True, "ja": ja, "zh": " ".join(c["zh"] for c in cues), "cues": cues})
 
@@ -1791,11 +1872,18 @@ class Handler(BaseHTTPRequestHandler):
                 # Persist after the cache read so a cached chunk still lands in
                 # the SRT (a restart replays keys that are still in memory).
                 if save:
+                    # 没有字幕的窗口通常也要登记（第二遍才不用重跑 ffmpeg 确认）。
+                    # 但 VAD 很确信有人声、却没出字幕，说明多半是判定误杀（退化/
+                    # 幻觉被丢弃）——这种不登记，留给下次重试。
+                    err = result.get("error") or ""
+                    confident = result.get("_vmax", 0.0) >= VOICE_CONFIDENT
+                    mark = not (err and err != "silence" and confident)
+                    if not mark:
+                        trace("[srt] leave @%.1f unmarked (vmax=%.2f, err=%s) for retry"
+                              % (start, result.get("_vmax", 0.0), err))
                     try:
-                        # 没有字幕的窗口也要登记：否则第二遍还得重跑 ffmpeg
-                        # 才能确认这一段确实没人说话。
                         get_sidecar(video).add(result.get("cues") or [],
-                                               start, duration)
+                                               start, duration, mark=mark)
                     except Exception as exc:
                         trace("[srt] add failed: %s" % exc)
             # src= 直接告诉你这一块走的是哪条路：
